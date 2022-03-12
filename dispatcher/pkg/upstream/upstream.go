@@ -22,6 +22,8 @@ import (
 	"crypto/tls"
 	"fmt"
 	"github.com/IrineSistiana/mosdns/v3/dispatcher/pkg/dnsutils"
+	"github.com/IrineSistiana/mosdns/v3/dispatcher/pkg/pool"
+	"github.com/lucas-clemente/quic-go"
 	"go.uber.org/zap"
 	"golang.org/x/net/http2"
 	"golang.org/x/net/proxy"
@@ -46,8 +48,10 @@ var (
 // Upstream represents a DNS upstream.
 type Upstream interface {
 	// ExchangeContext exchanges query message q to the upstream, and returns
-	// response.
-	ExchangeContext(ctx context.Context, q []byte) ([]byte, error)
+	// response. It MUST NOT keep or modify q.
+	// The returned msg buffer is larger than 12 bytes. Which is the minimum size of
+	// a valid dns package.
+	ExchangeContext(ctx context.Context, q []byte) (*pool.Buffer, error)
 
 	// CloseIdleConnections closes any connections in the Upstream which
 	// now sitting idle. It does not interrupt any connections currently in use.
@@ -59,17 +63,29 @@ type Opt struct {
 	// actually dial to.
 	DialAddr string
 
+	Bootstrap string
+
 	// Socks5 specifies the socks5 proxy server that the upstream
 	// will connect though. Currently, only tcp, dot, doh upstream support Socks5 proxy.
 	Socks5 string
 
 	// IdleTimeout used by tcp, dot, doh to control connection idle timeout.
-	// Default: tcp & dot: 0 (disable connection reuse), doh: 30s.
+	// If negative, tcp, dot will not reuse connections.
+	// Default: tcp & dot: 10s , doh: 30s.
 	IdleTimeout time.Duration
 
-	// MaxConns limits the total number of connections,
-	// including connections in the dialing states.
-	// Used by tcp, dot, doh. Default: 1.
+	// EnablePipeline enables the query pipelining as RFC 7766 6.2.1.1 suggested.
+	// Available for tcp/dot upstream with IdleTimeout >= 0.
+	EnablePipeline bool
+
+	// EnableHTTP3 enables the HTTP/3 for DoH. Note that there is no HTTP/2 fallback.
+	EnableHTTP3 bool
+
+	// MaxConns limits the total number of connections, including connections
+	// in the dialing states.
+	// MaxConns takes effect on tcp/dot upstream with IdleTimeout >= 0 and EnablePipeline.
+	// And doh upstream.
+	// Default is 1.
 	MaxConns int
 
 	// TLSConfig specifies the tls.Config that the TLS client will use.
@@ -110,20 +126,49 @@ func NewUpstream(addr string, opt *Opt) (Upstream, error) {
 	switch addrURL.Scheme {
 	case "", "udp":
 		dialAddr := getDialAddrWithPort(addrURL.Host, opt.DialAddr, 53)
-		t := &Transport{
+		ut := &Transport{
+			Logger: opt.Logger,
+			DialFunc: func(ctx context.Context) (net.Conn, error) {
+				d := net.Dialer{
+					Resolver: &net.Resolver{
+						PreferGo: true,
+						Dial:     nil,
+					},
+				}
+				return d.DialContext(ctx, "udp", dialAddr)
+			},
+			WriteFunc: func(c io.Writer, m []byte) (int, error) {
+				return c.Write(m)
+			},
+			ReadFunc: func(c io.Reader) (*pool.Buffer, int, error) {
+				readBuf := pool.GetBuf(64 * 1024)
+				defer readBuf.Release()
+				rb := readBuf.Bytes()
+				n, err := c.Read(rb)
+				if err != nil {
+					return nil, n, err
+				}
+				b := pool.GetBuf(n)
+				copy(b.Bytes(), rb[:n])
+				return b, n, nil
+			},
+			EnablePipeline: true,
+			MaxConns:       opt.MaxConns,
+			IdleTimeout:    time.Second * 60,
+		}
+		tt := &Transport{
 			Logger: opt.Logger,
 			DialFunc: func(ctx context.Context) (net.Conn, error) {
 				d := net.Dialer{}
-				return d.DialContext(ctx, "udp", dialAddr)
+				return d.DialContext(ctx, "tcp", dialAddr)
 			},
-			WriteFunc: dnsutils.WriteRawMsgToUDP,
-			ReadFunc: func(c io.Reader) ([]byte, int, error) {
-				return dnsutils.ReadRawMsgFromUDP(c, dnsutils.IPv4UdpMaxPayload)
-			},
-			MaxConns:    opt.MaxConns,
-			IdleTimeout: time.Second * 60,
+			WriteFunc: dnsutils.WriteRawMsgToTCP,
+			ReadFunc:  dnsutils.ReadRawMsgFromTCP,
 		}
-		return t, nil
+		return &udpWithFallback{
+			u: ut,
+			t: tt,
+		}, nil
 	case "tcp":
 		dialAddr := getDialAddrWithPort(addrURL.Host, opt.DialAddr, 53)
 		t := &Transport{
@@ -131,9 +176,11 @@ func NewUpstream(addr string, opt *Opt) (Upstream, error) {
 			DialFunc: func(ctx context.Context) (net.Conn, error) {
 				return dialTCP(ctx, dialAddr, opt.Socks5)
 			},
-			WriteFunc:   dnsutils.WriteRawMsgToTCP,
-			ReadFunc:    dnsutils.ReadRawMsgFromTCP,
-			IdleTimeout: opt.IdleTimeout,
+			WriteFunc:      dnsutils.WriteRawMsgToTCP,
+			ReadFunc:       dnsutils.ReadRawMsgFromTCP,
+			IdleTimeout:    opt.IdleTimeout,
+			EnablePipeline: opt.EnablePipeline,
+			MaxConns:       opt.MaxConns,
 		}
 		return t, nil
 	case "tls":
@@ -162,9 +209,11 @@ func NewUpstream(addr string, opt *Opt) (Upstream, error) {
 				}
 				return tlsConn, nil
 			},
-			WriteFunc:   dnsutils.WriteRawMsgToTCP,
-			ReadFunc:    dnsutils.ReadRawMsgFromTCP,
-			IdleTimeout: opt.IdleTimeout,
+			WriteFunc:      dnsutils.WriteRawMsgToTCP,
+			ReadFunc:       dnsutils.ReadRawMsgFromTCP,
+			IdleTimeout:    opt.IdleTimeout,
+			EnablePipeline: opt.EnablePipeline,
+			MaxConns:       opt.MaxConns,
 		}
 		return t, nil
 	case "https":
@@ -178,26 +227,45 @@ func NewUpstream(addr string, opt *Opt) (Upstream, error) {
 		}
 
 		dialAddr := getDialAddrWithPort(addrURL.Host, opt.DialAddr, 443)
-		t := &http.Transport{
-			DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) { // overwrite server addr
-				return dialTCP(ctx, dialAddr, opt.Socks5)
-			},
-			TLSClientConfig:     opt.TLSConfig,
-			TLSHandshakeTimeout: tlsHandshakeTimeout,
-			IdleConnTimeout:     idleConnTimeout,
+		var t http.RoundTripper
+		if opt.EnableHTTP3 {
+			t = &h3rt{
+				logger:    opt.Logger,
+				tlsConfig: opt.TLSConfig,
+				quicConfig: &quic.Config{
+					TokenStore:                     quic.NewLRUTokenStore(4, 8),
+					InitialStreamReceiveWindow:     64 * 1024,
+					MaxStreamReceiveWindow:         128 * 1024,
+					InitialConnectionReceiveWindow: 256 * 1024,
+					MaxConnectionReceiveWindow:     512 * 1024,
+				},
+				dialFunc: func(network, addr string, tlsCfg *tls.Config, cfg *quic.Config) (quic.EarlySession, error) {
+					return quic.DialAddrHostContext(context.Background(), dialAddr, addrURL.Host, tlsCfg, cfg, true)
+				},
+			}
+		} else {
+			t1 := &http.Transport{
+				DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) { // overwrite server addr
+					return dialTCP(ctx, dialAddr, opt.Socks5)
+				},
+				TLSClientConfig:     opt.TLSConfig,
+				TLSHandshakeTimeout: tlsHandshakeTimeout,
+				IdleConnTimeout:     idleConnTimeout,
 
-			// MaxConnsPerHost and MaxIdleConnsPerHost should be equal.
-			// Otherwise, it might seriously affect the efficiency of connection reuse.
-			MaxConnsPerHost:     maxConn,
-			MaxIdleConnsPerHost: maxConn,
-		}
+				// MaxConnsPerHost and MaxIdleConnsPerHost should be equal.
+				// Otherwise, it might seriously affect the efficiency of connection reuse.
+				MaxConnsPerHost:     maxConn,
+				MaxIdleConnsPerHost: maxConn,
+			}
 
-		t2, err := http2.ConfigureTransports(t)
-		if err != nil {
-			return nil, fmt.Errorf("failed to upgrade http2 support, %w", err)
+			t2, err := http2.ConfigureTransports(t1)
+			if err != nil {
+				return nil, fmt.Errorf("failed to upgrade http2 support, %w", err)
+			}
+			t2.ReadIdleTimeout = time.Second * 30
+			t2.PingTimeout = time.Second * 5
+			t = t1
 		}
-		t2.ReadIdleTimeout = time.Second * 30
-		t2.PingTimeout = time.Second * 5
 
 		return &DoH{
 			EndPoint: addr,
@@ -226,4 +294,26 @@ func tryRemovePort(s string) string {
 		return s
 	}
 	return host
+}
+
+type udpWithFallback struct {
+	u *Transport
+	t *Transport
+}
+
+func (u *udpWithFallback) ExchangeContext(ctx context.Context, q []byte) (*pool.Buffer, error) {
+	b, err := u.u.ExchangeContext(ctx, q)
+	if err != nil {
+		return nil, err
+	}
+	if isTruncated(b.Bytes()) {
+		u.u.logger().Warn("truncated udp msg received, retrying tcp")
+		return u.t.ExchangeContext(ctx, q)
+	}
+	return b, nil
+}
+
+func (u *udpWithFallback) CloseIdleConnections() {
+	u.u.CloseIdleConnections()
+	u.t.CloseIdleConnections()
 }

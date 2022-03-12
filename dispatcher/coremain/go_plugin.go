@@ -1,3 +1,5 @@
+//go:build go_plugin
+
 //     Copyright (C) 2020-2021, IrineSistiana
 //
 //     This file is part of mosdns.
@@ -15,10 +17,16 @@
 //     You should have received a copy of the GNU General Public License
 //     along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-package netlist
+package coremain
 
-import "net"
+import (
+	"github.com/IrineSistiana/mosdns/v3/dispatcher/mlog"
+	"go.uber.org/zap"
+	"plugin"
+)
 
-type Matcher interface {
-	Match(ip net.IP) (bool, error)
+var openGoPlugin = func(path string) error {
+	mlog.L().Info("loading go plugin library", zap.String("library", path))
+	_, err := plugin.Open(path)
+	return err
 }

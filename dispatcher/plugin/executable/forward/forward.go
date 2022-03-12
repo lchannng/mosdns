@@ -133,8 +133,28 @@ func (u *upstreamWrapper) Address() string {
 	return u.dnsproxyUpstream.Address()
 }
 
-func (u *upstreamWrapper) Exchange(_ context.Context, q *dns.Msg) (*dns.Msg, error) {
-	return u.dnsproxyUpstream.Exchange(q)
+func (u *upstreamWrapper) Exchange(ctx context.Context, q *dns.Msg) (*dns.Msg, error) {
+	type res struct {
+		r   *dns.Msg
+		err error
+	}
+	resChan := make(chan *res, 1)
+
+	// Remainder: Always makes a copy of q. dnsproxy/upstream may keep or even modify the q in their
+	// Exchange() calls.
+	qCopy := q.Copy()
+	go func() {
+		r := new(res)
+		r.r, r.err = u.dnsproxyUpstream.Exchange(qCopy)
+		resChan <- r
+	}()
+
+	select {
+	case r := <-resChan:
+		return r.r, r.err
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
 }
 
 func (u *upstreamWrapper) Trusted() bool {

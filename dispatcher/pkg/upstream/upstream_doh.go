@@ -26,6 +26,7 @@ import (
 	"github.com/miekg/dns"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 )
 
@@ -49,21 +50,21 @@ var (
 	bufPool512 = pool.NewBytesBufPool(512)
 )
 
-func (u *DoH) ExchangeContext(ctx context.Context, q []byte) ([]byte, error) {
-	buf := pool.GetBuf(len(q))
-	defer pool.ReleaseBuf(buf)
-
-	copy(buf, q)
+func (u *DoH) ExchangeContext(ctx context.Context, q []byte) (*pool.Buffer, error) {
 
 	// In order to maximize HTTP cache friendliness, DoH clients using media
 	// formats that include the ID field from the DNS message header, such
 	// as "application/dns-message", SHOULD use a DNS ID of 0 in every DNS
 	// request.
 	// https://tools.ietf.org/html/rfc8484#section-4.1
-	buf[0] = 0
-	buf[1] = 0
+	buf := pool.GetBuf(len(q))
+	defer buf.Release()
+	b := buf.Bytes()
+	copy(b, q)
+	b[0] = 0
+	b[1] = 0
 
-	urlLen := len(u.EndPoint) + 5 + base64.RawURLEncoding.EncodedLen(len(buf))
+	urlLen := len(u.EndPoint) + 5 + base64.RawURLEncoding.EncodedLen(len(b))
 	urlBuf := make([]byte, urlLen)
 
 	// Padding characters for base64url MUST NOT be included.
@@ -71,11 +72,16 @@ func (u *DoH) ExchangeContext(ctx context.Context, q []byte) ([]byte, error) {
 	// That's why we use base64.RawURLEncoding.
 	p := 0
 	p += copy(urlBuf[p:], u.EndPoint)
-	p += copy(urlBuf[p:], "?dns=")
-	base64.RawURLEncoding.Encode(urlBuf[p:], buf)
+	// A simple way to check whether the endpoint already has a parameter.
+	if strings.LastIndexByte(u.EndPoint, '?') >= 0 {
+		p += copy(urlBuf[p:], "&dns=")
+	} else {
+		p += copy(urlBuf[p:], "?dns=")
+	}
+	base64.RawURLEncoding.Encode(urlBuf[p:], b)
 
 	type result struct {
-		r   []byte
+		r   *pool.Buffer
 		err error
 	}
 
@@ -84,10 +90,10 @@ func (u *DoH) ExchangeContext(ctx context.Context, q []byte) ([]byte, error) {
 		// We overwrite the ctx with a fixed timout context here.
 		// Because the http package may close the underlay connection
 		// if the context is done before the query is completed. This
-		// reduces the connection reuse rate.
+		// reduces the connection reuse efficiency.
 		ctx, cancel := context.WithTimeout(context.Background(), defaultDoHTimeout)
 		defer cancel()
-		r, err := u.doHTTP(ctx, utils.BytesToStringUnsafe(urlBuf))
+		r, err := u.exchangeMustHasHeader(ctx, utils.BytesToStringUnsafe(urlBuf))
 		resChan <- &result{r: r, err: err}
 	}()
 
@@ -100,18 +106,20 @@ func (u *DoH) ExchangeContext(ctx context.Context, q []byte) ([]byte, error) {
 		if err != nil {
 			return nil, err
 		}
-		setMsgId(r, getMsgId(q))
+		setMsgId(r.Bytes(), getMsgId(q))
 		return r, nil
 	}
 }
 
-func (u *DoH) doHTTP(ctx context.Context, url string) ([]byte, error) {
+// exchangeMustHasHeader always return a msg larger than 12 bytes.
+func (u *DoH) exchangeMustHasHeader(ctx context.Context, url string) (*pool.Buffer, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return nil, fmt.Errorf("interal err: NewRequestWithContext: %w", err)
 	}
 
 	req.Header["Accept"] = []string{"application/dns-message"}
+	req.Header["User-Agent"] = nil // Don't let go http send a default user agent header.
 	resp, err := u.Client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("http request failed: %w", err)
@@ -120,6 +128,10 @@ func (u *DoH) doHTTP(ctx context.Context, url string) ([]byte, error) {
 
 	// check status code
 	if resp.StatusCode != http.StatusOK {
+		body1k, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
+		if body1k != nil {
+			return nil, fmt.Errorf("bad http status codes %d with body [%s]", resp.StatusCode, body1k)
+		}
 		return nil, fmt.Errorf("bad http status codes %d", resp.StatusCode)
 	}
 
@@ -130,7 +142,11 @@ func (u *DoH) doHTTP(ctx context.Context, url string) ([]byte, error) {
 		return nil, fmt.Errorf("failed to read http body: %w", err)
 	}
 
-	r := make([]byte, bb.Len())
-	copy(r, bb.Bytes())
+	if bb.Len() < headerSize {
+		return nil, fmt.Errorf("invalid dns data [%x]", bb.Bytes())
+	}
+
+	r := pool.GetBuf(bb.Len())
+	copy(r.Bytes(), bb.Bytes())
 	return r, nil
 }

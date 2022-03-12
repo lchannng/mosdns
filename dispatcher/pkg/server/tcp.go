@@ -59,17 +59,10 @@ func (s *Server) ServeTCP(l net.Listener) error {
 	for {
 		c, err := ol.Accept()
 		if err != nil {
-			netErr, ok := err.(net.Error)
-			if ok && netErr.Temporary() {
-				s.getLogger().Warn("listener temporary err", zap.Error(err))
-				time.Sleep(time.Second * 5)
-				continue
-			} else {
-				if s.Closed() {
-					return ErrServerClosed
-				}
-				return fmt.Errorf("unexpected listener err: %w", err)
+			if s.Closed() {
+				return ErrServerClosed
 			}
+			return fmt.Errorf("unexpected listener err: %w", err)
 		}
 
 		tcpConnCtx, cancelConn := context.WithCancel(listenerCtx)
@@ -91,24 +84,29 @@ func (s *Server) ServeTCP(l net.Listener) error {
 				} else {
 					c.SetReadDeadline(time.Now().Add(idleTimeout))
 				}
-				req, _, err := dnsutils.ReadRawMsgFromTCP(c)
+				reqBuf, _, err := dnsutils.ReadRawMsgFromTCP(c)
 				if err != nil {
 					return // read err, close the connection
 				}
 
 				go func() {
-					var meta *handler.RequestMeta
+					defer reqBuf.Release()
+
+					meta := new(handler.RequestMeta)
 					if clientIP := utils.GetIPFromAddr(c.RemoteAddr()); clientIP != nil {
-						meta = &handler.RequestMeta{ClientIP: clientIP}
+						meta.ClientIP = clientIP
 					} else {
 						s.getLogger().Warn("failed to acquire client ip addr")
 					}
-					s.DNSHandler.ServeDNS(
+					if err := s.DNSHandler.ServeDNS(
 						tcpConnCtx,
-						req,
+						reqBuf.Bytes(),
 						&tcpResponseWriter{c: c},
-						meta, // maybe nil
-					)
+						meta,
+					); err != nil {
+						s.getLogger().Warn("handler err", zap.Error(err))
+						c.Close()
+					}
 				}()
 			}
 		}()

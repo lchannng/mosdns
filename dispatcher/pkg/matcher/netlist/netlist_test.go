@@ -19,13 +19,14 @@ package netlist
 
 import (
 	"bytes"
-	"math/bits"
 	"net"
 	"testing"
 )
 
 func TestIPNetList_Sort_And_Merge(t *testing.T) {
 	raw := `
+192.168.0.0/32 # merged
+192.168.0.0/24 # merged
 192.168.0.0/16
 192.168.1.1/24 # merged
 192.168.9.24/24 # merged
@@ -59,8 +60,8 @@ func TestIPNetList_Sort_And_Merge(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := ipNetList.Contains(tt.testIP); got != tt.want {
-				t.Errorf("IPNetList.Contains() = %v, want %v", got, tt.want)
+			if got, _ := ipNetList.Match(tt.testIP); got != tt.want {
+				t.Errorf("IPNetList.Match() = %v, want %v", got, tt.want)
 			}
 		})
 	}
@@ -109,24 +110,9 @@ func TestIPNetList_New_And_Contains(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := ipNetList.Contains(tt.testIP); got != tt.want {
-				t.Errorf("IPNetList.Contains() = %v, want %v", got, tt.want)
+			if got, _ := ipNetList.Match(tt.testIP); got != tt.want {
+				t.Errorf("IPNetList.Match() = %v, want %v", got, tt.want)
 			}
 		})
-	}
-}
-
-func Test_initMasks(t *testing.T) {
-	for i := 0; i < 129; i++ {
-		m := masks[i]
-		ones := 0
-		zeros := 0
-		for j := 0; j < 2; j++ {
-			ones += bits.OnesCount64(m[j])
-			zeros += bits.TrailingZeros64(m[j])
-		}
-		if ones != i || zeros != (128-ones) {
-			t.Fatalf("%v is not a /%d mask", m, i)
-		}
 	}
 }

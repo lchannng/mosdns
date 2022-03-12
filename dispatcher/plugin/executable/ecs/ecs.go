@@ -140,15 +140,13 @@ var (
 // have a *dns.EDNS0_SUBNET before.
 func (e *ecsPlugin) addECS(qCtx *handler.Context) (upgraded bool, newECS bool, err error) {
 	q := qCtx.Q()
-	var clientIP net.IP
-	if meta := qCtx.ReqMeta(); meta != nil {
-		clientIP = meta.ClientIP
-	}
+
+	clientIP := qCtx.ReqMeta().ClientIP // Maybe nil.
 
 	opt := q.IsEdns0()
 	hasECS := opt != nil && dnsutils.GetECS(opt) != nil
 	if hasECS && !e.args.ForceOverwrite {
-		// Argument args.ForceOverwrite is disabled. q already has a edns0 subnet. Skip it.
+		// Argument args.ForceOverwrite is disabled. q already has an edns0 subnet. Skip it.
 		return false, false, nil
 	}
 

@@ -64,6 +64,8 @@ type UpstreamConfig struct {
 
 	IdleTimeout        int  `yaml:"idle_timeout"`
 	MaxConns           int  `yaml:"max_conns"`
+	EnablePipeline     bool `yaml:"enable_pipeline"`
+	EnableHTTP3        bool `yaml:"enable_http3"`
 	InsecureSkipVerify bool `yaml:"insecure_skip_verify"`
 }
 
@@ -99,10 +101,12 @@ func newFastForward(bp *handler.BP, args *Args) (*fastForward, error) {
 		}
 
 		opt := &upstream.Opt{
-			DialAddr:    c.DialAddr,
-			Socks5:      c.Socks5,
-			IdleTimeout: time.Duration(c.IdleTimeout) * time.Second,
-			MaxConns:    c.MaxConns,
+			DialAddr:       c.DialAddr,
+			Socks5:         c.Socks5,
+			IdleTimeout:    time.Duration(c.IdleTimeout) * time.Second,
+			MaxConns:       c.MaxConns,
+			EnablePipeline: c.EnablePipeline,
+			EnableHTTP3:    c.EnableHTTP3,
 			TLSConfig: &tls.Config{
 				InsecureSkipVerify: c.InsecureSkipVerify,
 				RootCAs:            rootCAs,
@@ -152,14 +156,18 @@ func (u *upstreamWrapper) Exchange(ctx context.Context, q *dns.Msg) (*dns.Msg, e
 	if err != nil {
 		return nil, err
 	}
-	defer pool.ReleaseBuf(buf)
+	defer buf.Release()
+
 	rRaw, err := u.u.ExchangeContext(ctx, qRaw)
 	if err != nil {
 		return nil, err
 	}
+
 	r := new(dns.Msg)
-	if err := r.Unpack(rRaw); err != nil {
-		return nil, err
+	err = r.Unpack(rRaw.Bytes())
+	rRaw.Release()
+	if err != nil {
+		return nil, fmt.Errorf("failed to unpack response data [%x], %w", rRaw.Bytes(), err)
 	}
 	return r, nil
 }

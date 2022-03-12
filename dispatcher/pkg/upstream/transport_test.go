@@ -5,9 +5,11 @@ import (
 	"errors"
 	"fmt"
 	"github.com/IrineSistiana/mosdns/v3/dispatcher/pkg/dnsutils"
+	"github.com/IrineSistiana/mosdns/v3/dispatcher/pkg/pool"
 	"github.com/miekg/dns"
 	"go.uber.org/zap"
 	"io"
+	"math/rand"
 	"net"
 	"sync"
 	"testing"
@@ -15,15 +17,17 @@ import (
 )
 
 func TestTransport_Exchange(t *testing.T) {
+	randSleep20 := func() { time.Sleep(time.Millisecond * time.Duration(rand.Intn(20))) }
 	dial := func(ctx context.Context) (net.Conn, error) {
 		c1, c2 := net.Pipe()
 		go func() {
 			for {
-				m, _, readErr := dnsutils.ReadMsgFromTCP(c2)
+				m, _, readErr := dnsutils.ReadRawMsgFromTCP(c2)
 				if m != nil {
 					go func() {
-						time.Sleep(time.Millisecond * 50)
-						dnsutils.WriteMsgToTCP(c2, m)
+						defer m.Release()
+						randSleep20()
+						dnsutils.WriteRawMsgToTCP(c2, m.Bytes())
 					}()
 				}
 				if readErr != nil {
@@ -31,6 +35,7 @@ func TestTransport_Exchange(t *testing.T) {
 				}
 			}
 		}()
+		randSleep20()
 		return c1, nil
 	}
 
@@ -38,29 +43,36 @@ func TestTransport_Exchange(t *testing.T) {
 		return nil, errors.New("dial err")
 	}
 
-	write := dnsutils.WriteRawMsgToTCP
+	write := func(c io.Writer, m []byte) (n int, err error) {
+		randSleep20()
+		return dnsutils.WriteRawMsgToTCP(c, m)
+	}
 
-	read := dnsutils.ReadRawMsgFromTCP
+	read := func(c io.Reader) (m *pool.Buffer, n int, err error) {
+		randSleep20()
+		return dnsutils.ReadRawMsgFromTCP(c)
+	}
 
 	writeErr := func(c io.Writer, m []byte) (n int, err error) {
 		return 0, errors.New("write err")
 	}
 
-	readErr := func(c io.Reader) (m []byte, n int, err error) {
+	readErr := func(c io.Reader) (m *pool.Buffer, n int, err error) {
 		return nil, 0, errors.New("read err")
 	}
 
-	readTimeout := func(c io.Reader) (m []byte, n int, err error) {
-		time.Sleep(time.Second * 10)
+	readTimeout := func(c io.Reader) (m *pool.Buffer, n int, err error) {
+		time.Sleep(time.Second * 1)
 		return nil, 0, errors.New("read err")
 	}
 
 	type fields struct {
-		DialFunc    func(ctx context.Context) (net.Conn, error)
-		WriteFunc   func(c io.Writer, m []byte) (n int, err error)
-		ReadFunc    func(c io.Reader) (m []byte, n int, err error)
-		MaxConns    int
-		IdleTimeout time.Duration
+		DialFunc       func(ctx context.Context) (net.Conn, error)
+		WriteFunc      func(c io.Writer, m []byte) (n int, err error)
+		ReadFunc       func(c io.Reader) (m *pool.Buffer, n int, err error)
+		MaxConns       int
+		IdleTimeout    time.Duration
+		EnablePipeline bool
 	}
 
 	tests := []struct {
@@ -75,10 +87,54 @@ func TestTransport_Exchange(t *testing.T) {
 				DialFunc:    dial,
 				WriteFunc:   write,
 				ReadFunc:    read,
-				IdleTimeout: 0,
+				IdleTimeout: -1,
 			},
 			N:       16,
 			wantErr: false,
+		},
+		{
+			name: "no connection reuse, dial err",
+			fields: fields{
+				DialFunc:    dialErr,
+				WriteFunc:   write,
+				ReadFunc:    read,
+				IdleTimeout: -1,
+			},
+			N:       16,
+			wantErr: true,
+		},
+		{
+			name: "no connection reuse, write err",
+			fields: fields{
+				DialFunc:    dial,
+				WriteFunc:   writeErr,
+				ReadFunc:    read,
+				IdleTimeout: -1,
+			},
+			N:       16,
+			wantErr: true,
+		},
+		{
+			name: "no connection reuse, read err",
+			fields: fields{
+				DialFunc:    dial,
+				WriteFunc:   write,
+				ReadFunc:    readErr,
+				IdleTimeout: -1,
+			},
+			N:       16,
+			wantErr: true,
+		},
+		{
+			name: "no connection reuse, read timeout",
+			fields: fields{
+				DialFunc:    dial,
+				WriteFunc:   write,
+				ReadFunc:    readTimeout,
+				IdleTimeout: -1,
+			},
+			N:       16,
+			wantErr: true,
 		},
 		{
 			name: "connection reuse",
@@ -86,52 +142,116 @@ func TestTransport_Exchange(t *testing.T) {
 				DialFunc:    dial,
 				WriteFunc:   write,
 				ReadFunc:    read,
-				IdleTimeout: time.Millisecond * 100,
-				MaxConns:    5,
+				IdleTimeout: time.Millisecond * 200,
 			},
 			N:       32,
 			wantErr: false,
 		},
 		{
-			name: "dial err",
+			name: "connection reuse dial err",
 			fields: fields{
 				DialFunc:    dialErr,
 				WriteFunc:   write,
 				ReadFunc:    read,
-				IdleTimeout: time.Millisecond * 100,
+				IdleTimeout: time.Millisecond * 200,
 			},
 			N:       16,
 			wantErr: true,
 		},
 		{
-			name: "write err",
+			name: "connection reuse write err",
 			fields: fields{
 				DialFunc:    dial,
 				WriteFunc:   writeErr,
 				ReadFunc:    read,
-				IdleTimeout: time.Millisecond * 100,
+				IdleTimeout: time.Millisecond * 200,
 			},
 			N:       16,
 			wantErr: true,
 		},
 		{
-			name: "read err",
+			name: "connection reuse read err",
 			fields: fields{
 				DialFunc:    dial,
 				WriteFunc:   write,
 				ReadFunc:    readErr,
-				IdleTimeout: time.Millisecond * 100,
+				IdleTimeout: time.Millisecond * 200,
 			},
 			N:       16,
 			wantErr: true,
 		},
 		{
-			name: "read timeout",
+			name: "connection reuse read timeout",
 			fields: fields{
 				DialFunc:    dial,
 				WriteFunc:   write,
 				ReadFunc:    readTimeout,
-				IdleTimeout: time.Millisecond * 100,
+				IdleTimeout: time.Millisecond * 200,
+			},
+			N:       16,
+			wantErr: true,
+		},
+		{
+			name: "pipeline connection reuse",
+			fields: fields{
+				DialFunc:       dial,
+				WriteFunc:      write,
+				ReadFunc:       read,
+				IdleTimeout:    time.Millisecond * 100,
+				EnablePipeline: true,
+				MaxConns:       16,
+			},
+			N:       32,
+			wantErr: false,
+		},
+		{
+			name: "pipeline connection reuse dial err",
+			fields: fields{
+				DialFunc:       dialErr,
+				WriteFunc:      write,
+				ReadFunc:       read,
+				IdleTimeout:    time.Millisecond * 100,
+				EnablePipeline: true,
+				MaxConns:       16,
+			},
+			N:       16,
+			wantErr: true,
+		},
+		{
+			name: "pipeline connection reuse write err",
+			fields: fields{
+				DialFunc:       dial,
+				WriteFunc:      writeErr,
+				ReadFunc:       read,
+				IdleTimeout:    time.Millisecond * 100,
+				EnablePipeline: true,
+				MaxConns:       16,
+			},
+			N:       16,
+			wantErr: true,
+		},
+		{
+			name: "pipeline connection reuse read err",
+			fields: fields{
+				DialFunc:       dial,
+				WriteFunc:      write,
+				ReadFunc:       readErr,
+				IdleTimeout:    time.Millisecond * 100,
+				EnablePipeline: true,
+				MaxConns:       16,
+			},
+			N:       16,
+			wantErr: true,
+		},
+		{
+			name: "pipeline connection reuse read timeout",
+			fields: fields{
+				DialFunc:       dial,
+				WriteFunc:      write,
+				ReadFunc:       readTimeout,
+				IdleTimeout:    time.Millisecond * 100,
+				EnablePipeline: true,
+				MaxConns:       16,
 			},
 			N:       16,
 			wantErr: true,
@@ -147,7 +267,8 @@ func TestTransport_Exchange(t *testing.T) {
 				ReadFunc:        tt.fields.ReadFunc,
 				MaxConns:        tt.fields.MaxConns,
 				IdleTimeout:     tt.fields.IdleTimeout,
-				MaxQueryPerConn: 8,
+				EnablePipeline:  tt.fields.EnablePipeline,
+				MaxQueryPerConn: 2,
 			}
 
 			ctx, cancel := context.WithTimeout(context.Background(), time.Millisecond*100)
@@ -172,6 +293,7 @@ func TestTransport_Exchange(t *testing.T) {
 				i := i
 				go func() {
 					defer wg.Done()
+					randSleep20()
 					q := new(dns.Msg)
 					qName := fmt.Sprintf("%d.", i)
 					q.SetQuestion(qName, dns.TypeA)
@@ -180,7 +302,7 @@ func TestTransport_Exchange(t *testing.T) {
 						t.Error(err)
 						return
 					}
-					ctx, cancel := context.WithTimeout(context.Background(), time.Millisecond*100)
+					ctx, cancel := context.WithTimeout(context.Background(), time.Millisecond*500)
 					defer cancel()
 
 					gotR, err := transport.ExchangeContext(ctx, raw)
@@ -190,7 +312,7 @@ func TestTransport_Exchange(t *testing.T) {
 					}
 
 					r := new(dns.Msg)
-					if err := r.Unpack(gotR); err != nil {
+					if err := r.Unpack(gotR.Bytes()); err != nil {
 						t.Error(err)
 						return
 					}
@@ -208,15 +330,15 @@ func TestTransport_Exchange(t *testing.T) {
 			wg.Wait()
 			time.Sleep(tt.fields.IdleTimeout + time.Millisecond*100)
 
-			transport.cm.Lock()
-			if n := len(transport.clientConns); n != 0 {
-				t.Errorf("len(t.clientConns), want 0, got %d", n)
+			transport.pm.Lock()
+			if n := len(transport.pConns); n != 0 {
+				t.Errorf("len(t.pConns), want 0, got %d", n)
 			}
 
 			if n := len(transport.dCalls); n != 0 {
-				t.Errorf("len(t.clientConns), want 0, got %d", n)
+				t.Errorf("len(t.pConns), want 0, got %d", n)
 			}
-			transport.cm.Unlock()
+			transport.pm.Unlock()
 		})
 	}
 }
