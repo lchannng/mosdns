@@ -25,10 +25,10 @@ import (
 	"fmt"
 	"github.com/IrineSistiana/mosdns/v3/dispatcher/handler"
 	"github.com/IrineSistiana/mosdns/v3/dispatcher/pkg/bundled_upstream"
-	"github.com/IrineSistiana/mosdns/v3/dispatcher/pkg/pool"
 	"github.com/IrineSistiana/mosdns/v3/dispatcher/pkg/upstream"
 	"github.com/IrineSistiana/mosdns/v3/dispatcher/pkg/utils"
 	"github.com/miekg/dns"
+	"strings"
 	"time"
 )
 
@@ -100,6 +100,12 @@ func newFastForward(bp *handler.BP, args *Args) (*fastForward, error) {
 			return nil, errors.New("missing server addr")
 		}
 
+		if strings.HasPrefix(c.Addr, "udpme://") {
+			u := newMEU(c.Addr[8:], c.Trusted)
+			us = append(us, u)
+			continue
+		}
+
 		opt := &upstream.Opt{
 			DialAddr:       c.DialAddr,
 			Socks5:         c.Socks5,
@@ -152,24 +158,7 @@ type upstreamWrapper struct {
 }
 
 func (u *upstreamWrapper) Exchange(ctx context.Context, q *dns.Msg) (*dns.Msg, error) {
-	qRaw, buf, err := pool.PackBuffer(q)
-	if err != nil {
-		return nil, err
-	}
-	defer buf.Release()
-
-	rRaw, err := u.u.ExchangeContext(ctx, qRaw)
-	if err != nil {
-		return nil, err
-	}
-
-	r := new(dns.Msg)
-	err = r.Unpack(rRaw.Bytes())
-	rRaw.Release()
-	if err != nil {
-		return nil, fmt.Errorf("failed to unpack response data [%x], %w", rRaw.Bytes(), err)
-	}
-	return r, nil
+	return u.u.ExchangeContext(ctx, q)
 }
 
 func (u *upstreamWrapper) Address() string {
