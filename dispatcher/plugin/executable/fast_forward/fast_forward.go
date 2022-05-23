@@ -102,8 +102,11 @@ func newFastForward(bp *handler.BP, args *Args) (*fastForward, error) {
 		}
 
 		if strings.HasPrefix(c.Addr, "udpme://") {
-			u := newMEU(c.Addr[8:], c.Trusted)
+			u := newUDPME(c.Addr[8:], c.Trusted)
 			us = append(us, u)
+			if i == 0 {
+				u.trusted = true
+			}
 			continue
 		}
 
@@ -197,7 +200,7 @@ func (f *fastForward) exec(ctx context.Context, qCtx *handler.Context) (err erro
 
 func (f *fastForward) Shutdown() error {
 	for _, u := range f.trackedUpstream {
-		u.CloseIdleConnections()
+		u.Close()
 	}
 	return nil
 }
