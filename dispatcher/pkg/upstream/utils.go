@@ -20,36 +20,9 @@ package upstream
 import (
 	"context"
 	"fmt"
-	"github.com/miekg/dns"
 	"golang.org/x/net/proxy"
 	"net"
-	"time"
 )
-
-// getContextDeadline tries to get the deadline of ctx or return a default
-// deadline.
-func getContextDeadline(ctx context.Context, defTimeout time.Duration) time.Time {
-	ddl, ok := ctx.Deadline()
-	if ok {
-		return ddl
-	}
-	return time.Now().Add(defTimeout)
-}
-
-func shadowCopy(m *dns.Msg) *dns.Msg {
-	nm := new(dns.Msg)
-	*nm = *m
-	return nm
-}
-
-func chanClosed(c chan struct{}) bool {
-	select {
-	case <-c:
-		return true
-	default:
-		return false
-	}
-}
 
 func dialTCP(ctx context.Context, addr, socks5 string, mark int) (net.Conn, error) {
 	if len(socks5) > 0 {

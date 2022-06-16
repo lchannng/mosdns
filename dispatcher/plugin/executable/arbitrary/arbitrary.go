@@ -19,8 +19,10 @@ package arbitrary
 
 import (
 	"context"
+	"fmt"
 	"github.com/IrineSistiana/mosdns/v3/dispatcher/handler"
-	arb "github.com/IrineSistiana/mosdns/v3/dispatcher/pkg/arbitrary"
+	"github.com/IrineSistiana/mosdns/v3/dispatcher/pkg/zone_file"
+	"strings"
 )
 
 const PluginType = "arbitrary"
@@ -29,36 +31,41 @@ func init() {
 	handler.RegInitFunc(PluginType, Init, func() interface{} { return new(Args) })
 }
 
-var _ handler.ExecutablePlugin = (*arbitraryPlugin)(nil)
-
 type Args struct {
 	RR []string `yaml:"rr"`
 }
 
+var _ handler.ExecutablePlugin = (*arbitraryPlugin)(nil)
+
 type arbitraryPlugin struct {
 	*handler.BP
-	arbitrary *arb.Arbitrary
+	m *zone_file.Matcher
 }
 
-func Init(bp *handler.BP, args interface{}) (p handler.Plugin, err error) {
-	return newArb(bp, args.(*Args))
-}
-
-func newArb(bp *handler.BP, args *Args) (*arbitraryPlugin, error) {
-	a := arb.NewArbitrary()
-	if err := a.BatchLoad(args.RR); err != nil {
-		return nil, err
-	}
-	return &arbitraryPlugin{
-		BP:        bp,
-		arbitrary: a,
-	}, nil
-}
-
-func (a *arbitraryPlugin) Exec(ctx context.Context, qCtx *handler.Context, next handler.ExecutableChainNode) error {
-	if r := a.arbitrary.LookupMsg(qCtx.Q()); r != nil {
+func (p *arbitraryPlugin) Exec(ctx context.Context, qCtx *handler.Context, next handler.ExecutableChainNode) error {
+	if r := p.m.Reply(qCtx.Q()); r != nil {
 		qCtx.SetResponse(r, handler.ContextStatusResponded)
 		return nil
 	}
 	return handler.ExecChainNode(ctx, qCtx, next)
+}
+
+func Init(bp *handler.BP, v interface{}) (p handler.Plugin, err error) {
+	args := v.(*Args)
+	m := new(zone_file.Matcher)
+	for i, s := range args.RR {
+		if strings.HasPrefix(s, "ext:") {
+			s = strings.TrimPrefix(s, "ext:")
+			if err := m.LoadFile(s); err != nil {
+				return nil, fmt.Errorf("failed to load zone file #%d %s, %w", i, s, err)
+			}
+		}
+		if err := m.Load(strings.NewReader(s)); err != nil {
+			return nil, fmt.Errorf("failed to load rr #%d [%s], %w", i, s, err)
+		}
+	}
+	return &arbitraryPlugin{
+		BP: bp,
+		m:  m,
+	}, nil
 }

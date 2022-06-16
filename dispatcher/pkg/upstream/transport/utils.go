@@ -15,17 +15,26 @@
 //     You should have received a copy of the GNU General Public License
 //     along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-package v2data
+package transport
 
 import (
-	"github.com/IrineSistiana/mosdns/v3/dispatcher/pkg/matcher/domain"
-	"github.com/IrineSistiana/mosdns/v3/dispatcher/pkg/matcher/netlist"
+	"context"
+	"github.com/miekg/dns"
+	"time"
 )
 
-func init() {
-	// register domain loader
-	domain.LoadFromDATFunc = LoadMixMatcherFromDAT
+// getContextDeadline tries to get the deadline of ctx or return a default
+// deadline.
+func getContextDeadline(ctx context.Context, defTimeout time.Duration) time.Time {
+	ddl, ok := ctx.Deadline()
+	if ok {
+		return ddl
+	}
+	return time.Now().Add(defTimeout)
+}
 
-	// register netlist loader
-	netlist.LoadFromDATFunc = LoadNetListFromDAT
+func shadowCopy(m *dns.Msg) *dns.Msg {
+	nm := new(dns.Msg)
+	*nm = *m
+	return nm
 }
