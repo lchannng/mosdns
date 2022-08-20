@@ -1,8 +1,8 @@
 NAME=mosdns
 BINDIR=bin
 VERSION=$(shell git describe --tags --long --always || echo "unknown version")
-BUILDTIME=$(shell date -u)
-GOBUILD=CGO_ENABLED=0 go build -trimpath -ldflags '-X "main.version=$(VERSION)" \
+BUILDTIME=$(shell date +"%Y-%m-%dT%H:%M:%S%z")
+GOBUILD=CGO_ENABLED=0 go build -trimpath -ldflags '-X "main.version=$(VERSION)" -X "main.buildTime=$(BUILDTIME)" \
 		-w -s -buildid='
 
 PLATFORM_LIST = \

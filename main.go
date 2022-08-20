@@ -27,10 +27,12 @@ import (
 	_ "github.com/IrineSistiana/mosdns/v4/tools"
 	"github.com/spf13/cobra"
 	_ "net/http/pprof"
+	"runtime"
 )
 
 var (
-	version = "dev/unknown"
+	version   = "dev/unknown"
+	buildTime = "unknown"
 )
 
 func init() {
@@ -38,7 +40,8 @@ func init() {
 		Use:   "version",
 		Short: "Print out version info and exit.",
 		Run: func(cmd *cobra.Command, args []string) {
-			fmt.Println(version)
+			fmt.Printf("mosdns %s %s %s with %s %s\n",
+				version, runtime.GOOS, runtime.GOARCH, runtime.Version(), buildTime)
 		},
 	})
 }
