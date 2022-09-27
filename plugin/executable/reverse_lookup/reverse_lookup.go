@@ -25,6 +25,7 @@ import (
 	"github.com/IrineSistiana/mosdns/v4/coremain"
 	"github.com/IrineSistiana/mosdns/v4/pkg/executable_seq"
 	"github.com/IrineSistiana/mosdns/v4/pkg/query_context"
+	"github.com/IrineSistiana/mosdns/v4/pkg/utils"
 	"github.com/miekg/dns"
 	"net"
 	"net/http"
@@ -43,7 +44,20 @@ func init() {
 var _ coremain.ExecutablePlugin = (*reverseLookup)(nil)
 
 type Args struct {
-	TTL int // Default is 10.
+	Size      int    `yaml:"size"` // Default is 64*1024
+	Redis     string `yaml:"redis"`
+	HandlePTR bool   `yaml:"handle_ptr"`
+	TTL       int    `yaml:"ttl"` // Default is 1800 (30min)
+}
+
+func (a *Args) initDefault() *Args {
+	if a.Size <= 0 {
+		a.Size = 64 * 1024
+	}
+	if a.TTL <= 0 {
+		a.TTL = 1800
+	}
+	return a
 }
 
 type reverseLookup struct {
@@ -53,6 +67,7 @@ type reverseLookup struct {
 }
 
 func (p *reverseLookup) ServeHTTP(w http.ResponseWriter, req *http.Request) {
+	req.Context()
 	ipStr := req.URL.Query().Get("ip")
 	addr, err := netip.ParseAddr(ipStr)
 	if err != nil {
@@ -61,24 +76,58 @@ func (p *reverseLookup) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	d := p.store.lookup(addr)
+	d := p.store.lookup(netip.AddrFrom16(addr.As16()).String())
 	w.Write([]byte(d))
 }
 
 func Init(bp *coremain.BP, args interface{}) (p coremain.Plugin, err error) {
-	return newReverseLookup(bp, args.(*Args)), nil
+	return newReverseLookup(bp, args.(*Args))
 }
 
-func newReverseLookup(bp *coremain.BP, args *Args) coremain.Plugin {
+func newReverseLookup(bp *coremain.BP, args *Args) (coremain.Plugin, error) {
+	args.initDefault()
+	s, err := newStore(storeOpts{
+		size:   args.Size,
+		redis:  args.Redis,
+		logger: bp.L(),
+	})
+	if err != nil {
+		return nil, err
+	}
 	p := &reverseLookup{
 		BP:    bp,
 		args:  args,
-		store: newStore(),
+		store: s,
 	}
-	return p
+	return p, nil
 }
 
 func (p *reverseLookup) Exec(ctx context.Context, qCtx *query_context.Context, next executable_seq.ExecutableChainNode) error {
+	q := qCtx.Q()
+	if p.args.HandlePTR && len(q.Question) > 0 && q.Question[0].Qtype == dns.TypePTR {
+		question := q.Question[0]
+		addr, err := utils.ParsePTRName(question.Name)
+		if err != nil {
+			return fmt.Errorf("failed to parse ptr name to ip, %w", err)
+		}
+		fqdn := p.store.lookup(addr.String())
+		if len(fqdn) > 0 {
+			r := new(dns.Msg)
+			r.SetReply(q)
+			r.Answer = append(r.Answer, &dns.PTR{
+				Hdr: dns.RR_Header{
+					Name:   question.Name,
+					Rrtype: question.Qtype,
+					Class:  question.Qclass,
+					Ttl:    5,
+				},
+				Ptr: fqdn,
+			})
+			qCtx.SetResponse(r, query_context.ContextStatusResponded)
+			return nil
+		}
+	}
+
 	if err := executable_seq.ExecChainNode(ctx, qCtx, next); err != nil {
 		return err
 	}
@@ -97,20 +146,15 @@ func (p *reverseLookup) Exec(ctx context.Context, qCtx *query_context.Context, n
 		default:
 			continue
 		}
-		addr, ok := netip.AddrFromSlice(ip)
-		if !ok {
-			return fmt.Errorf("invalid ip %s", ip)
-		}
-
 		h := rr.Header()
-		ttl := uint32(p.args.TTL)
-		if ttl == 0 {
-			ttl = 10
+		if int(h.Ttl) > p.args.TTL {
+			h.Ttl = uint32(p.args.TTL)
 		}
-		if h.Ttl > ttl {
-			h.Ttl = ttl
+		name := h.Name
+		if len(q.Question) == 1 {
+			name = q.Question[0].Name
 		}
-		p.store.save(rr.Header().Name, time.Duration(ttl)*time.Second, addr)
+		p.store.save(ip.String(), name, time.Duration(p.args.TTL)*time.Second)
 	}
 	return nil
 }
