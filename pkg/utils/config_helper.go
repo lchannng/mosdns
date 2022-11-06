@@ -1,5 +1,3 @@
-//go:build !linux
-
 /*
  * Copyright (C) 2020-2022, IrineSistiana
  *
@@ -19,10 +17,39 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-package upstream
+package utils
 
-import "syscall"
+import (
+	"github.com/mitchellh/mapstructure"
+	"golang.org/x/exp/constraints"
+)
 
-func getSocketControlFunc(_ socketOpts) func(string, string, syscall.RawConn) error {
-	return nil
+func SetDefaultNum[K constraints.Integer | constraints.Float](p *K, d K) {
+	if *p == 0 {
+		*p = d
+	}
+}
+
+func CheckNumRange[K constraints.Integer | constraints.Float](v, min, max K) bool {
+	if v < min || v > max {
+		return false
+	}
+	return true
+}
+
+// WeakDecode decodes args from config to output.
+func WeakDecode(in map[string]interface{}, output interface{}) error {
+	config := &mapstructure.DecoderConfig{
+		ErrorUnused:      true,
+		Result:           output,
+		WeaklyTypedInput: true,
+		TagName:          "yaml",
+	}
+
+	decoder, err := mapstructure.NewDecoder(config)
+	if err != nil {
+		return err
+	}
+
+	return decoder.Decode(in)
 }

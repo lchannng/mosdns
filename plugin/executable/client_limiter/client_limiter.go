@@ -21,14 +21,11 @@ package client_limiter
 
 import (
 	"context"
-	"fmt"
 	"github.com/IrineSistiana/mosdns/v4/coremain"
 	"github.com/IrineSistiana/mosdns/v4/pkg/concurrent_limiter"
 	"github.com/IrineSistiana/mosdns/v4/pkg/executable_seq"
 	"github.com/IrineSistiana/mosdns/v4/pkg/query_context"
 	"github.com/miekg/dns"
-	"go.uber.org/zap"
-	"net/netip"
 	"sync"
 	"time"
 )
@@ -52,32 +49,20 @@ type Limiter struct {
 
 	closeOnce   sync.Once
 	closeNotify chan struct{}
-
-	v4Mask, v6Mask int // not zero
-	hpLimiter      *concurrent_limiter.HPClientLimiter
+	hpLimiter   *concurrent_limiter.HPClientLimiter
 }
 
 func NewLimiter(bp *coremain.BP, args *Args) (*Limiter, error) {
-	if m := args.V4Mask; m < 0 || m > 32 {
-		return nil, fmt.Errorf("invalid ipv4 mask %d, should be 0~32", m)
+	hpl, err := concurrent_limiter.NewHPClientLimiter(concurrent_limiter.HPLimiterOpts{
+		Threshold: args.MaxQPS,
+		Interval:  time.Second,
+	})
+	if err != nil {
+		return nil, err
 	}
-	v4Mask := 32
-	if m := args.V4Mask; m != 0 {
-		v4Mask = args.V4Mask
-	}
-	if m := args.V6Mask; m < 0 || m > 128 {
-		return nil, fmt.Errorf("invalid ipv6 mask %d, should be 0~128", m)
-	}
-	v6Mask := 48
-	if m := args.V6Mask; m != 0 {
-		v6Mask = args.V6Mask
-	}
-
 	l := &Limiter{
 		BP:          bp,
-		v4Mask:      v4Mask,
-		v6Mask:      v6Mask,
-		hpLimiter:   concurrent_limiter.NewHPClientLimiter(args.MaxQPS),
+		hpLimiter:   hpl,
 		closeNotify: make(chan struct{}),
 	}
 	go l.cleanerLoop()
@@ -85,42 +70,18 @@ func NewLimiter(bp *coremain.BP, args *Args) (*Limiter, error) {
 }
 
 func (l *Limiter) Exec(ctx context.Context, qCtx *query_context.Context, next executable_seq.ExecutableChainNode) error {
-	addr, ok := l.parseClientAddr(qCtx)
-	if !ok {
+	addr := qCtx.ReqMeta().ClientAddr
+	if !addr.IsValid() {
 		return executable_seq.ExecChainNode(ctx, qCtx, next)
 	}
-	if ok := l.hpLimiter.Acquire(addr); !ok {
+	if ok := l.hpLimiter.AcquireToken(addr); !ok {
+		l.BP.M().GetBadIPObserver().Observe(addr)
 		r := new(dns.Msg)
 		r.SetRcode(qCtx.Q(), dns.RcodeRefused)
-		qCtx.SetResponse(r, query_context.ContextStatusRejected)
+		qCtx.SetResponse(r)
 		return nil
 	}
 	return executable_seq.ExecChainNode(ctx, qCtx, next)
-}
-
-func (l *Limiter) parseClientAddr(qCtx *query_context.Context) (netip.Addr, bool) {
-	meta := qCtx.ReqMeta()
-	if meta == nil {
-		return netip.Addr{}, false
-	}
-	ip := meta.ClientIP
-	if ip == nil {
-		return netip.Addr{}, false
-	}
-	addr, ok := netip.AddrFromSlice(ip)
-	if !ok {
-		l.BP.L().Error("query context has a invalid client ip", zap.Binary("ip", ip))
-		return netip.Addr{}, false
-	}
-
-	switch {
-	case addr.Is4():
-		return netip.PrefixFrom(addr, l.v4Mask).Masked().Addr(), true
-	case addr.Is4In6():
-		return netip.PrefixFrom(addr.Unmap(), l.v4Mask).Masked().Addr(), true
-	default:
-		return netip.PrefixFrom(addr, l.v6Mask).Masked().Addr(), true
-	}
 }
 
 func (l *Limiter) Close() error {
