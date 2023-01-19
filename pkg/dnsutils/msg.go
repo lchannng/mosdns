@@ -20,12 +20,8 @@
 package dnsutils
 
 import (
-	"encoding/binary"
-	"github.com/IrineSistiana/mosdns/v4/pkg/pool"
-	"github.com/IrineSistiana/mosdns/v4/pkg/utils"
 	"github.com/miekg/dns"
 	"strconv"
-	"strings"
 )
 
 // GetMinimalTTL returns the minimal ttl of this msg.
@@ -133,7 +129,6 @@ func QtypeToString(u uint16) string {
 func GenEmptyReply(q *dns.Msg, rcode int) *dns.Msg {
 	r := new(dns.Msg)
 	r.SetRcode(q, rcode)
-	r.RecursionAvailable = true
 
 	var name string
 	if len(q.Question) > 1 {
@@ -162,41 +157,4 @@ func FakeSOA(name string) *dns.SOA {
 		Expire:  604800,
 		Minttl:  86400,
 	}
-}
-
-// GetMsgKey unpacks m and set its id to salt.
-func GetMsgKey(m *dns.Msg, salt uint16) (string, error) {
-	wireMsg, err := m.Pack()
-	if err != nil {
-		return "", err
-	}
-	wireMsg[0] = byte(salt >> 8)
-	wireMsg[1] = byte(salt)
-	return utils.BytesToStringUnsafe(wireMsg), nil
-}
-
-// GetMsgKeyWithBytesSalt unpacks m and appends salt to the string.
-func GetMsgKeyWithBytesSalt(m *dns.Msg, salt []byte) (string, error) {
-	wireMsg, buf, err := pool.PackBuffer(m)
-	if err != nil {
-		return "", err
-	}
-	defer buf.Release()
-
-	wireMsg[0] = 0
-	wireMsg[1] = 0
-
-	sb := new(strings.Builder)
-	sb.Grow(len(wireMsg) + len(salt))
-	sb.Write(wireMsg)
-	sb.Write(salt)
-
-	return sb.String(), nil
-}
-
-// GetMsgKeyWithInt64Salt unpacks m and appends salt to the string.
-func GetMsgKeyWithInt64Salt(m *dns.Msg, salt int64) (string, error) {
-	b := make([]byte, 8)
-	binary.BigEndian.PutUint64(b, uint64(salt))
-	return GetMsgKeyWithBytesSalt(m, b)
 }

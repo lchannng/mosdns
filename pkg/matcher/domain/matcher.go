@@ -20,8 +20,9 @@
 package domain
 
 import (
+	"errors"
 	"fmt"
-	"github.com/IrineSistiana/mosdns/v4/pkg/utils"
+	"github.com/IrineSistiana/mosdns/v5/pkg/utils"
 	"regexp"
 	"strings"
 )
@@ -202,11 +203,10 @@ type MixMatcher[T any] struct {
 
 func NewMixMatcher[T any]() *MixMatcher[T] {
 	return &MixMatcher[T]{
-		defaultMatcher: MatcherFull,
-		full:           NewFullMatcher[T](),
-		domain:         NewSubDomainMatcher[T](),
-		regex:          NewRegexMatcher[T](),
-		keyword:        NewKeywordMatcher[T](),
+		full:    NewFullMatcher[T](),
+		domain:  NewSubDomainMatcher[T](),
+		regex:   NewRegexMatcher[T](),
+		keyword: NewKeywordMatcher[T](),
 	}
 }
 
@@ -228,13 +228,15 @@ func (m *MixMatcher[T]) GetSubMatcher(typ string) WriteableMatcher[T] {
 	return nil
 }
 
+var ErrNodefaultMatcher = errors.New("default matcher is not set")
+
 func (m *MixMatcher[T]) Add(s string, v T) error {
 	typ, pattern := m.splitTypeAndPattern(s)
 	if len(typ) == 0 {
 		if len(m.defaultMatcher) != 0 {
 			typ = m.defaultMatcher
 		} else {
-			typ = MatcherFull
+			return ErrNodefaultMatcher
 		}
 	}
 	sm := m.GetSubMatcher(typ)
@@ -255,7 +257,7 @@ func (m *MixMatcher[T]) Match(s string) (v T, ok bool) {
 
 func (m *MixMatcher[T]) Len() int {
 	sum := 0
-	for _, matcher := range [...]Matcher[T]{m.full, m.domain, m.regex, m.keyword} {
+	for _, matcher := range [...]interface{ Len() int }{m.full, m.domain, m.regex, m.keyword} {
 		if matcher == nil {
 			continue
 		}

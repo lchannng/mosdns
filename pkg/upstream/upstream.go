@@ -23,11 +23,12 @@ import (
 	"context"
 	"crypto/tls"
 	"fmt"
-	"github.com/IrineSistiana/mosdns/v4/pkg/dnsutils"
-	"github.com/IrineSistiana/mosdns/v4/pkg/upstream/bootstrap"
-	"github.com/IrineSistiana/mosdns/v4/pkg/upstream/doh"
-	"github.com/IrineSistiana/mosdns/v4/pkg/upstream/h3roundtripper"
-	"github.com/IrineSistiana/mosdns/v4/pkg/upstream/transport"
+	"github.com/IrineSistiana/mosdns/v5/mlog"
+	"github.com/IrineSistiana/mosdns/v5/pkg/dnsutils"
+	"github.com/IrineSistiana/mosdns/v5/pkg/upstream/bootstrap"
+	"github.com/IrineSistiana/mosdns/v5/pkg/upstream/doh"
+	"github.com/IrineSistiana/mosdns/v5/pkg/upstream/h3roundtripper"
+	"github.com/IrineSistiana/mosdns/v5/pkg/upstream/transport"
 	"github.com/lucas-clemente/quic-go"
 	"github.com/miekg/dns"
 	"go.uber.org/zap"
@@ -103,11 +104,18 @@ type Opt struct {
 
 	// Logger specifies the logger that the upstream will use.
 	Logger *zap.Logger
+
+	// EventObserver can observe connection events.
+	// Note: Not Implemented for HTTP/3 upstreams.
+	EventObserver EventObserver
 }
 
-func NewUpstream(addr string, opt *Opt) (Upstream, error) {
-	if opt == nil {
-		opt = new(Opt)
+func NewUpstream(addr string, opt Opt) (Upstream, error) {
+	if opt.Logger == nil {
+		opt.Logger = mlog.Nop()
+	}
+	if opt.EventObserver == nil {
+		opt.EventObserver = nopEO{}
 	}
 
 	// parse protocol and server addr
@@ -120,7 +128,7 @@ func NewUpstream(addr string, opt *Opt) (Upstream, error) {
 	}
 
 	dialer := &net.Dialer{
-		Resolver: bootstrap.NewPlainBootstrap(opt.Bootstrap),
+		Resolver: bootstrap.NewBootstrap(opt.Bootstrap),
 		Control: getSocketControlFunc(socketOpts{
 			so_mark:        opt.SoMark,
 			bind_to_device: opt.BindToDevice,
@@ -130,54 +138,47 @@ func NewUpstream(addr string, opt *Opt) (Upstream, error) {
 	switch addrURL.Scheme {
 	case "", "udp":
 		dialAddr := getDialAddrWithPort(addrURL.Host, opt.DialAddr, 53)
-
-		uto := transport.Opts{
-			Logger: opt.Logger,
-			DialFunc: func(ctx context.Context) (net.Conn, error) {
-				return dialer.DialContext(ctx, "udp", dialAddr)
+		uto := transport.IOOpts{
+			DialFunc: func(ctx context.Context) (io.ReadWriteCloser, error) {
+				c, err := dialer.DialContext(ctx, "udp", dialAddr)
+				c = wrapConn(c, opt.EventObserver)
+				return c, err
 			},
 			WriteFunc: dnsutils.WriteMsgToUDP,
 			ReadFunc: func(c io.Reader) (*dns.Msg, int, error) {
 				return dnsutils.ReadMsgFromUDP(c, 4096)
 			},
-			EnablePipeline: true,
-			MaxConns:       opt.MaxConns,
-			IdleTimeout:    time.Second * 60,
+			IdleTimeout: time.Minute * 5,
 		}
-		ut, err := transport.NewTransport(uto)
-		if err != nil {
-			return nil, fmt.Errorf("cannot init udp transport, %w", err)
-		}
-		tto := transport.Opts{
-			Logger: opt.Logger,
-			DialFunc: func(ctx context.Context) (net.Conn, error) {
-				return dialer.DialContext(ctx, "tcp", dialAddr)
+		tto := transport.IOOpts{
+			DialFunc: func(ctx context.Context) (io.ReadWriteCloser, error) {
+				c, err := dialer.DialContext(ctx, "tcp", dialAddr)
+				c = wrapConn(c, opt.EventObserver)
+				return c, err
 			},
 			WriteFunc: dnsutils.WriteMsgToTCP,
 			ReadFunc:  dnsutils.ReadMsgFromTCP,
 		}
-		tt, err := transport.NewTransport(tto)
-		if err != nil {
-			return nil, fmt.Errorf("cannot init tcp transport, %w", err)
-		}
 		return &udpWithFallback{
-			u: ut,
-			t: tt,
+			u: transport.NewPipelineTransport(transport.PipelineOpts{IOOpts: uto, MaxConn: 1}),
+			t: transport.NewReuseConnTransport(transport.ReuseConnOpts{IOOpts: tto}),
 		}, nil
 	case "tcp":
 		dialAddr := getDialAddrWithPort(addrURL.Host, opt.DialAddr, 53)
-		to := transport.Opts{
-			Logger: opt.Logger,
-			DialFunc: func(ctx context.Context) (net.Conn, error) {
-				return dialTCP(ctx, dialAddr, opt.Socks5, dialer)
+		to := transport.IOOpts{
+			DialFunc: func(ctx context.Context) (io.ReadWriteCloser, error) {
+				c, err := dialTCP(ctx, dialAddr, opt.Socks5, dialer)
+				c = wrapConn(c, opt.EventObserver)
+				return c, err
 			},
-			WriteFunc:      dnsutils.WriteMsgToTCP,
-			ReadFunc:       dnsutils.ReadMsgFromTCP,
-			IdleTimeout:    opt.IdleTimeout,
-			EnablePipeline: opt.EnablePipeline,
-			MaxConns:       opt.MaxConns,
+			WriteFunc:   dnsutils.WriteMsgToTCP,
+			ReadFunc:    dnsutils.ReadMsgFromTCP,
+			IdleTimeout: opt.IdleTimeout,
 		}
-		return transport.NewTransport(to)
+		if opt.EnablePipeline {
+			return transport.NewPipelineTransport(transport.PipelineOpts{IOOpts: to, MaxConn: opt.MaxConns}), nil
+		}
+		return transport.NewReuseConnTransport(transport.ReuseConnOpts{IOOpts: to}), nil
 	case "tls":
 		var tlsConfig *tls.Config
 		if opt.TLSConfig != nil {
@@ -190,27 +191,29 @@ func NewUpstream(addr string, opt *Opt) (Upstream, error) {
 		}
 
 		dialAddr := getDialAddrWithPort(addrURL.Host, opt.DialAddr, 853)
-		to := transport.Opts{
-			Logger: opt.Logger,
-			DialFunc: func(ctx context.Context) (net.Conn, error) {
+		to := transport.IOOpts{
+			DialFunc: func(ctx context.Context) (io.ReadWriteCloser, error) {
 				conn, err := dialTCP(ctx, dialAddr, opt.Socks5, dialer)
 				if err != nil {
 					return nil, err
 				}
+				conn = wrapConn(conn, opt.EventObserver)
 				tlsConn := tls.Client(conn, tlsConfig)
 				if err := tlsConn.HandshakeContext(ctx); err != nil {
 					tlsConn.Close()
 					return nil, err
 				}
+
 				return tlsConn, nil
 			},
-			WriteFunc:      dnsutils.WriteMsgToTCP,
-			ReadFunc:       dnsutils.ReadMsgFromTCP,
-			IdleTimeout:    opt.IdleTimeout,
-			EnablePipeline: opt.EnablePipeline,
-			MaxConns:       opt.MaxConns,
+			WriteFunc:   dnsutils.WriteMsgToTCP,
+			ReadFunc:    dnsutils.ReadMsgFromTCP,
+			IdleTimeout: opt.IdleTimeout,
 		}
-		return transport.NewTransport(to)
+		if opt.EnablePipeline {
+			return transport.NewPipelineTransport(transport.PipelineOpts{IOOpts: to, MaxConn: opt.MaxConns}), nil
+		}
+		return transport.NewReuseConnTransport(transport.ReuseConnOpts{IOOpts: to}), nil
 	case "https":
 		idleConnTimeout := time.Second * 30
 		if opt.IdleTimeout > 0 {
@@ -252,7 +255,9 @@ func NewUpstream(addr string, opt *Opt) (Upstream, error) {
 		} else {
 			t1 := &http.Transport{
 				DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) { // overwrite server addr
-					return dialTCP(ctx, dialAddr, opt.Socks5, dialer)
+					c, err := dialTCP(ctx, dialAddr, opt.Socks5, dialer)
+					c = wrapConn(c, opt.EventObserver)
+					return c, err
 				},
 				TLSClientConfig:     opt.TLSConfig,
 				TLSHandshakeTimeout: tlsHandshakeTimeout,
@@ -304,8 +309,8 @@ func tryRemovePort(s string) string {
 }
 
 type udpWithFallback struct {
-	u *transport.Transport
-	t *transport.Transport
+	u *transport.PipelineTransport
+	t *transport.ReuseConnTransport
 }
 
 func (u *udpWithFallback) ExchangeContext(ctx context.Context, q *dns.Msg) (*dns.Msg, error) {

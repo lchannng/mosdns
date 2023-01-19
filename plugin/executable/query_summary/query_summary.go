@@ -21,11 +21,9 @@ package query_summary
 
 import (
 	"context"
-	"github.com/IrineSistiana/mosdns/v4/coremain"
-	"github.com/IrineSistiana/mosdns/v4/pkg/executable_seq"
-	"github.com/IrineSistiana/mosdns/v4/pkg/query_context"
+	"github.com/IrineSistiana/mosdns/v5/pkg/query_context"
+	"github.com/IrineSistiana/mosdns/v5/plugin/executable/sequence"
 	"go.uber.org/zap"
-	"time"
 )
 
 const (
@@ -33,61 +31,39 @@ const (
 )
 
 func init() {
-	coremain.RegNewPluginFunc(PluginType, Init, func() interface{} { return new(*Args) })
-	coremain.RegNewPersetPluginFunc("_query_summary", func(bp *coremain.BP) (coremain.Plugin, error) {
-		return newLogger(bp, &Args{}), nil
-	})
+	sequence.MustRegExecQuickSetup(PluginType, QuickSetup)
 }
 
-var _ coremain.ExecutablePlugin = (*logger)(nil)
+var _ sequence.RecursiveExecutable = (*SummaryLogger)(nil)
 
-type Args struct {
-	Msg string `yaml:"msg"`
+type SummaryLogger struct {
+	l   *zap.Logger
+	msg string
 }
 
-func (a *Args) init() {
-	if len(a.Msg) == 0 {
-		a.Msg = "query summary"
+// QuickSetup format: [msg_title]
+func QuickSetup(bq sequence.BQ, s string) (any, error) {
+	return NewSummaryLogger(bq.L(), s), nil
+}
+
+// NewSummaryLogger returns a SummaryLogger that logs query info into l.
+// l cannot be nil.
+// If msg is empty, "query summary" will be used.
+func NewSummaryLogger(l *zap.Logger, msg string) *SummaryLogger {
+	if len(msg) == 0 {
+		msg = "query summary"
+	}
+	return &SummaryLogger{
+		l:   l,
+		msg: msg,
 	}
 }
 
-type logger struct {
-	args *Args
-	*coremain.BP
-}
-
-// Init is a handler.NewPluginFunc.
-func Init(bp *coremain.BP, args interface{}) (p coremain.Plugin, err error) {
-	return newLogger(bp, args.(*Args)), nil
-}
-
-func newLogger(bp *coremain.BP, args *Args) coremain.Plugin {
-	args.init()
-	return &logger{BP: bp, args: args}
-}
-
-func (l *logger) Exec(ctx context.Context, qCtx *query_context.Context, next executable_seq.ExecutableChainNode) error {
-	err := executable_seq.ExecChainNode(ctx, qCtx, next)
-
-	q := qCtx.Q()
-	if len(q.Question) != 1 {
-		return nil
-	}
-	question := q.Question[0]
-	respRcode := -1
-	if r := qCtx.R(); r != nil {
-		respRcode = r.Rcode
-	}
-
-	l.BP.L().Info(
-		l.args.Msg,
-		zap.Uint32("uqid", qCtx.Id()),
-		zap.String("qname", question.Name),
-		zap.Uint16("qtype", question.Qtype),
-		zap.Uint16("qclass", question.Qclass),
-		zap.Stringer("client", qCtx.ReqMeta().ClientAddr),
-		zap.Int("resp_rcode", respRcode),
-		zap.Duration("elapsed", time.Now().Sub(qCtx.StartTime())),
+func (l *SummaryLogger) Exec(ctx context.Context, qCtx *query_context.Context, next sequence.ChainWalker) error {
+	err := next.ExecNext(ctx, qCtx)
+	l.l.Info(
+		l.msg,
+		zap.Inline(qCtx),
 		zap.Error(err),
 	)
 	return err

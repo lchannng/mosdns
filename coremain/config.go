@@ -20,87 +20,31 @@
 package coremain
 
 import (
-	"github.com/IrineSistiana/mosdns/v4/mlog"
-	"github.com/IrineSistiana/mosdns/v4/pkg/data_provider"
-	"github.com/IrineSistiana/mosdns/v4/pkg/utils"
+	"github.com/IrineSistiana/mosdns/v5/mlog"
 )
 
 type Config struct {
-	Log           mlog.LogConfig                     `yaml:"log"`
-	Include       []string                           `yaml:"include"`
-	DataProviders []data_provider.DataProviderConfig `yaml:"data_providers"`
-	Plugins       []PluginConfig                     `yaml:"plugins"`
-	Servers       []ServerConfig                     `yaml:"servers"`
-	API           APIConfig                          `yaml:"api"`
-
-	// Experimental
-	Security SecurityConfig `yaml:"security"`
+	Log     mlog.LogConfig `yaml:"log"`
+	Include []string       `yaml:"include"`
+	Plugins []PluginConfig `yaml:"plugins"`
+	API     APIConfig      `yaml:"api"`
 }
 
 // PluginConfig represents a plugin config
 type PluginConfig struct {
-	// Tag, required
+	// Tag for this plugin. Optional. If omitted, this plugin will
+	// be registered with a random tag.
 	Tag string `yaml:"tag"`
 
-	// Type, required
+	// Type, required.
 	Type string `yaml:"type"`
 
 	// Args, might be required by some plugins.
 	// The type of Args is depended on RegNewPluginFunc.
-	// If it's a map[string]interface{}, it will be converted by mapstruct.
-	Args interface{} `yaml:"args"`
-}
-
-type ServerConfig struct {
-	Exec      string                  `yaml:"exec"`
-	Timeout   uint                    `yaml:"timeout"` // (sec) query timeout.
-	Listeners []*ServerListenerConfig `yaml:"listeners"`
-}
-
-type ServerListenerConfig struct {
-	// Protocol: server protocol, can be:
-	// "", "udp" -> udp
-	// "tcp" -> tcp
-	// "dot", "tls" -> dns over tls
-	// "doh", "https" -> dns over https (rfc 8844)
-	// "http" -> dns over https (rfc 8844) but without tls
-	Protocol string `yaml:"protocol"`
-
-	// Addr: server "host:port" addr.
-	// Addr cannot be empty.
-	Addr string `yaml:"addr"`
-
-	Cert                string `yaml:"cert"`                    // certificate path, used by dot, doh
-	Key                 string `yaml:"key"`                     // certificate key path, used by dot, doh
-	URLPath             string `yaml:"url_path"`                // used by doh, http. If it's empty, any path will be handled.
-	GetUserIPFromHeader string `yaml:"get_user_ip_from_header"` // used by doh, http.
-	ProxyProtocol       bool   `yaml:"proxy_protocol"`          // accepting the PROXYProtocol
-
-	IdleTimeout uint `yaml:"idle_timeout"` // (sec) used by tcp, dot, doh as connection idle timeout.
+	// If it's a map[string]any, it will be converted by mapstruct.
+	Args any `yaml:"args"`
 }
 
 type APIConfig struct {
 	HTTP string `yaml:"http"`
-}
-
-type SecurityConfig struct {
-	BadIPObserver BadIPObserverConfig `yaml:"bad_ip_observer"`
-}
-
-// BadIPObserverConfig is a copy of ip_observer.BadIPObserverOpts.
-type BadIPObserverConfig struct {
-	Threshold        int    `yaml:"threshold"` // Zero Threshold will disable the bad ip observer.
-	Interval         int    `yaml:"interval"`  // (sec) Default is 10.
-	TTL              int    `yaml:"ttl"`       // (sec) Default is 600 (10min).
-	OnUpdateCallBack string `yaml:"on_update_callback"`
-	// IP masks to aggregate an IP range.
-	IPv4Mask int `yaml:"ipv4_mask"` // Default is 32.
-	IPv6Mask int `yaml:"ipv6_mask"` // Default is 48.
-}
-
-func (c *BadIPObserverConfig) Init() {
-	utils.SetDefaultNum(&c.Interval, 10)
-	utils.SetDefaultNum(&c.TTL, 600)
-	utils.SetDefaultNum(&c.IPv4Mask, 32)
-	utils.SetDefaultNum(&c.IPv6Mask, 48)
 }

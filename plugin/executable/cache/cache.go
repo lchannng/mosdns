@@ -21,21 +21,28 @@ package cache
 
 import (
 	"context"
+	"encoding/binary"
+	"errors"
 	"fmt"
-	"github.com/IrineSistiana/mosdns/v4/coremain"
-	"github.com/IrineSistiana/mosdns/v4/pkg/cache"
-	"github.com/IrineSistiana/mosdns/v4/pkg/cache/mem_cache"
-	"github.com/IrineSistiana/mosdns/v4/pkg/cache/redis_cache"
-	"github.com/IrineSistiana/mosdns/v4/pkg/dnsutils"
-	"github.com/IrineSistiana/mosdns/v4/pkg/executable_seq"
-	"github.com/IrineSistiana/mosdns/v4/pkg/pool"
-	"github.com/IrineSistiana/mosdns/v4/pkg/query_context"
-	"github.com/go-redis/redis/v8"
-	"github.com/golang/snappy"
+	"github.com/IrineSistiana/mosdns/v5/coremain"
+	"github.com/IrineSistiana/mosdns/v5/pkg/cache"
+	"github.com/IrineSistiana/mosdns/v5/pkg/pool"
+	"github.com/IrineSistiana/mosdns/v5/pkg/query_context"
+	"github.com/IrineSistiana/mosdns/v5/pkg/utils"
+	"github.com/IrineSistiana/mosdns/v5/plugin/executable/sequence"
+	"github.com/go-chi/chi/v5"
+	"github.com/klauspost/compress/gzip"
 	"github.com/miekg/dns"
 	"github.com/prometheus/client_golang/prometheus"
 	"go.uber.org/zap"
 	"golang.org/x/sync/singleflight"
+	"google.golang.org/protobuf/proto"
+	"io"
+	"net/http"
+	"os"
+	"strconv"
+	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -44,38 +51,43 @@ const (
 )
 
 func init() {
-	coremain.RegNewPluginFunc(PluginType, Init, func() interface{} { return new(Args) })
-
-	coremain.RegNewPersetPluginFunc("_default_cache", func(bp *coremain.BP) (coremain.Plugin, error) {
-		return newCachePlugin(bp, &Args{})
-	})
+	coremain.RegNewPluginFunc(PluginType, Init, func() any { return new(Args) })
+	sequence.MustRegExecQuickSetup(PluginType, quickSetupCache)
 }
 
 const (
 	defaultLazyUpdateTimeout = time.Second * 5
-	defaultEmptyAnswerTTL    = time.Second * 300
+	expiredMsgTtl            = 5
+
+	minimumChangesToDump   = 1024
+	dumpHeader             = "mosdns_cache_v1"
+	dumpBlockSize          = 128
+	dumpMaximumBlockLength = 1 << 20 // 1M block. 8kb pre entry. Should be enough.
 )
 
-var _ coremain.ExecutablePlugin = (*cachePlugin)(nil)
+var _ sequence.RecursiveExecutable = (*Cache)(nil)
 
 type Args struct {
-	Size              int    `yaml:"size"`
-	Redis             string `yaml:"redis"`
-	RedisTimeout      int    `yaml:"redis_timeout"`
-	LazyCacheTTL      int    `yaml:"lazy_cache_ttl"`
-	LazyCacheReplyTTL int    `yaml:"lazy_cache_reply_ttl"`
-	CacheEverything   bool   `yaml:"cache_everything"`
-	CompressResp      bool   `yaml:"compress_resp"`
-	WhenHit           string `yaml:"when_hit"`
+	Size         int    `yaml:"size"`
+	LazyCacheTTL int    `yaml:"lazy_cache_ttl"`
+	DumpFile     string `yaml:"dump_file"`
+	DumpInterval int    `yaml:"dump_interval"`
 }
 
-type cachePlugin struct {
-	*coremain.BP
+func (a *Args) init() {
+	utils.SetDefaultUnsignNum(&a.Size, 1024)
+	utils.SetDefaultUnsignNum(&a.DumpInterval, 600)
+}
+
+type Cache struct {
 	args *Args
 
-	whenHit      executable_seq.Executable
-	backend      cache.Backend
+	logger       *zap.Logger
+	backend      *cache.Cache[key, *item]
 	lazyUpdateSF singleflight.Group
+	closeOnce    sync.Once
+	closeNotify  chan struct{}
+	updatedKey   atomic.Uint64
 
 	queryTotal   prometheus.Counter
 	hitTotal     prometheus.Counter
@@ -83,92 +95,106 @@ type cachePlugin struct {
 	size         prometheus.GaugeFunc
 }
 
-func Init(bp *coremain.BP, args interface{}) (p coremain.Plugin, err error) {
-	return newCachePlugin(bp, args.(*Args))
+func Init(bp *coremain.BP, args any) (any, error) {
+	c := NewCache(args.(*Args), Opts{
+		Logger:     bp.L(),
+		MetricsTag: bp.Tag(),
+	})
+
+	if err := c.RegMetricsTo(prometheus.WrapRegistererWithPrefix(PluginType+"_", bp.M().GetMetricsReg())); err != nil {
+		return nil, fmt.Errorf("failed to register metrics, %w", err)
+	}
+	bp.RegAPI(c.Api())
+	return c, nil
 }
 
-func newCachePlugin(bp *coremain.BP, args *Args) (*cachePlugin, error) {
-	var c cache.Backend
-	if len(args.Redis) != 0 {
-		opt, err := redis.ParseURL(args.Redis)
+// QuickSetup format: [size]
+// default is 1024. If size is < 1024, 1024 will be used.
+func quickSetupCache(bq sequence.BQ, s string) (any, error) {
+	size := 0
+	if len(s) > 0 {
+		i, err := strconv.Atoi(s)
 		if err != nil {
-			return nil, fmt.Errorf("invalid redis url, %w", err)
+			return nil, fmt.Errorf("invalid size, %w", err)
 		}
-		opt.MaxRetries = -1
-		r := redis.NewClient(opt)
-		rcOpts := redis_cache.RedisCacheOpts{
-			Client:        r,
-			ClientCloser:  r,
-			ClientTimeout: time.Duration(args.RedisTimeout) * time.Millisecond,
-			Logger:        bp.L(),
-		}
-		rc, err := redis_cache.NewRedisCache(rcOpts)
-		if err != nil {
-			return nil, fmt.Errorf("failed to init redis cache, %w", err)
-		}
-		c = rc
-	} else {
-		c = mem_cache.NewMemCache(args.Size, 0)
+		size = i
+	}
+	// Don't register metrics in quick setup.
+	return NewCache(&Args{Size: size}, Opts{Logger: bq.L()}), nil
+}
+
+type Opts struct {
+	Logger     *zap.Logger
+	MetricsTag string
+}
+
+func NewCache(args *Args, opts Opts) *Cache {
+	args.init()
+
+	logger := opts.Logger
+	if logger == nil {
+		logger = zap.NewNop()
 	}
 
-	if args.LazyCacheReplyTTL <= 0 {
-		args.LazyCacheReplyTTL = 5
-	}
-
-	var whenHit executable_seq.Executable
-	if tag := args.WhenHit; len(tag) > 0 {
-		m := bp.M().GetExecutables()
-		whenHit = m[tag]
-		if whenHit == nil {
-			return nil, fmt.Errorf("cannot find exectable %s", tag)
-		}
-	}
-
-	p := &cachePlugin{
-		BP:      bp,
-		args:    args,
-		whenHit: whenHit,
-		backend: c,
+	backend := cache.New[key, *item](cache.Opts{Size: args.Size})
+	lb := map[string]string{"tag": opts.MetricsTag}
+	p := &Cache{
+		args:        args,
+		logger:      logger,
+		backend:     backend,
+		closeNotify: make(chan struct{}),
 
 		queryTotal: prometheus.NewCounter(prometheus.CounterOpts{
-			Name: "query_total",
-			Help: "The total number of processed queries",
+			Name:        "query_total",
+			Help:        "The total number of processed queries",
+			ConstLabels: lb,
 		}),
 		hitTotal: prometheus.NewCounter(prometheus.CounterOpts{
-			Name: "hit_total",
-			Help: "The total number of queries that hit the cache",
+			Name:        "hit_total",
+			Help:        "The total number of queries that hit the cache",
+			ConstLabels: lb,
 		}),
 		lazyHitTotal: prometheus.NewCounter(prometheus.CounterOpts{
-			Name: "lazy_hit_total",
-			Help: "The total number of queries that hit the expired cache",
+			Name:        "lazy_hit_total",
+			Help:        "The total number of queries that hit the expired cache",
+			ConstLabels: lb,
 		}),
 		size: prometheus.NewGaugeFunc(prometheus.GaugeOpts{
-			Name: "cache_size",
-			Help: "Current cache size in records",
+			Name:        "size_current",
+			Help:        "Current cache size in records",
+			ConstLabels: lb,
 		}, func() float64 {
-			return float64(c.Len())
+			return float64(backend.Len())
 		}),
 	}
-	bp.GetMetricsReg().MustRegister(p.queryTotal, p.hitTotal, p.lazyHitTotal, p.size)
-	return p, nil
+
+	if err := p.loadDump(); err != nil {
+		p.logger.Error("failed to load cache dump", zap.Error(err))
+	}
+	p.startDumpLoop()
+
+	return p
 }
 
-func (c *cachePlugin) Exec(ctx context.Context, qCtx *query_context.Context, next executable_seq.ExecutableChainNode) error {
+func (c *Cache) RegMetricsTo(r prometheus.Registerer) error {
+	for _, collector := range [...]prometheus.Collector{c.queryTotal, c.hitTotal, c.lazyHitTotal, c.size} {
+		if err := r.Register(collector); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (c *Cache) Exec(ctx context.Context, qCtx *query_context.Context, next sequence.ChainWalker) error {
 	c.queryTotal.Inc()
 	q := qCtx.Q()
 
-	msgKey, err := c.getMsgKey(q)
-	if err != nil {
-		c.L().Error("get msg key", qCtx.InfoField(), zap.Error(err))
-	}
+	msgKey := getMsgKey(q)
 	if len(msgKey) == 0 { // skip cache
-		return executable_seq.ExecChainNode(ctx, qCtx, next)
+		return next.ExecNext(ctx, qCtx)
 	}
 
-	cachedResp, lazyHit, err := c.lookupCache(msgKey)
-	if err != nil {
-		c.L().Error("lookup cache", qCtx.InfoField(), zap.Error(err))
-	}
+	cachedResp, lazyHit := getRespFromCache(msgKey, c.backend, c.args.LazyCacheTTL > 0, expiredMsgTtl)
 	if lazyHit {
 		c.lazyHitTotal.Inc()
 		c.doLazyUpdate(msgKey, qCtx, next)
@@ -176,151 +202,280 @@ func (c *cachePlugin) Exec(ctx context.Context, qCtx *query_context.Context, nex
 	if cachedResp != nil { // cache hit
 		c.hitTotal.Inc()
 		cachedResp.Id = q.Id // change msg id
-		c.L().Debug("cache hit", qCtx.InfoField())
+		shuffleIP(cachedResp)
 		qCtx.SetResponse(cachedResp)
-		if c.whenHit != nil {
-			return c.whenHit.Exec(ctx, qCtx, nil)
-		}
-		return nil
 	}
 
-	// cache miss, run the entry and try to store its response.
-	c.L().Debug("cache miss", qCtx.InfoField())
-	err = executable_seq.ExecChainNode(ctx, qCtx, next)
-	r := qCtx.R()
-	if r != nil {
-		if err := c.tryStoreMsg(msgKey, r); err != nil {
-			c.L().Error("cache store", qCtx.InfoField(), zap.Error(err))
-		}
+	err := next.ExecNext(ctx, qCtx)
+
+	if r := qCtx.R(); r != nil && cachedResp != r { // pointer compare. r is not cachedResp
+		saveRespToCache(msgKey, r, c.backend, c.args.LazyCacheTTL)
+		c.updatedKey.Add(1)
 	}
 	return err
 }
 
-// getMsgKey returns a string key for the query msg, or an empty
-// string if query should not be cached.
-func (c *cachePlugin) getMsgKey(q *dns.Msg) (string, error) {
-	isSimpleQuery := len(q.Question) == 1 && len(q.Answer) == 0 && len(q.Ns) == 0 && len(q.Extra) == 0
-	if isSimpleQuery || c.args.CacheEverything {
-		msgKey, err := dnsutils.GetMsgKey(q, 0)
-		if err != nil {
-			return "", fmt.Errorf("failed to unpack query msg, %w", err)
-		}
-		return msgKey, nil
-	}
-	return "", nil
-}
-
-// lookupCache returns the cached response. The ttl of returned msg will be changed properly.
-// Remember, caller must change the msg id.
-func (c *cachePlugin) lookupCache(msgKey string) (r *dns.Msg, lazyHit bool, err error) {
-	// lookup in cache
-	v, storedTime, _ := c.backend.Get(msgKey)
-
-	// cache hit
-	if v != nil {
-		if c.args.CompressResp {
-			decodeLen, err := snappy.DecodedLen(v)
-			if err != nil {
-				return nil, false, fmt.Errorf("snappy decode err: %w", err)
-			}
-			if decodeLen > dns.MaxMsgSize {
-				return nil, false, fmt.Errorf("invalid snappy data, not a dns msg, data len: %d", decodeLen)
-			}
-			decompressBuf := pool.GetBuf(decodeLen)
-			defer decompressBuf.Release()
-			v, err = snappy.Decode(decompressBuf.Bytes(), v)
-			if err != nil {
-				return nil, false, fmt.Errorf("snappy decode err: %w", err)
-			}
-		}
-		r = new(dns.Msg)
-		if err := r.Unpack(v); err != nil {
-			return nil, false, fmt.Errorf("failed to unpack cached data, %w", err)
-		}
-
-		var msgTTL time.Duration
-		if len(r.Answer) == 0 {
-			msgTTL = defaultEmptyAnswerTTL
-		} else {
-			msgTTL = time.Duration(dnsutils.GetMinimalTTL(r)) * time.Second
-		}
-
-		// not expired
-		if storedTime.Add(msgTTL).After(time.Now()) {
-			dnsutils.SubtractTTL(r, uint32(time.Since(storedTime).Seconds()))
-			return r, false, nil
-		}
-
-		// expired but lazy update enabled
-		if c.args.LazyCacheTTL > 0 {
-			// set the default ttl
-			dnsutils.SetTTL(r, uint32(c.args.LazyCacheReplyTTL))
-			return r, true, nil
-		}
-	}
-
-	// cache miss
-	return nil, false, nil
-}
-
 // doLazyUpdate starts a new goroutine to execute next node and update the cache in the background.
 // It has an inner singleflight.Group to de-duplicate same msgKey.
-func (c *cachePlugin) doLazyUpdate(msgKey string, qCtx *query_context.Context, next executable_seq.ExecutableChainNode) {
-	lazyQCtx := qCtx.Copy()
-	lazyUpdateFunc := func() (interface{}, error) {
-		c.L().Debug("start lazy cache update", lazyQCtx.InfoField())
+func (c *Cache) doLazyUpdate(msgKey string, qCtx *query_context.Context, next sequence.ChainWalker) {
+	qCtxCopy := qCtx.Copy()
+	lazyUpdateFunc := func() (any, error) {
 		defer c.lazyUpdateSF.Forget(msgKey)
-		lazyCtx, cancel := context.WithTimeout(context.Background(), defaultLazyUpdateTimeout)
+		qCtx := qCtxCopy
+
+		c.logger.Debug("start lazy cache update", qCtx.InfoField())
+		ctx, cancel := context.WithTimeout(context.Background(), defaultLazyUpdateTimeout)
 		defer cancel()
 
-		err := executable_seq.ExecChainNode(lazyCtx, lazyQCtx, next)
+		err := next.ExecNext(ctx, qCtx)
 		if err != nil {
-			c.L().Warn("failed to update lazy cache", lazyQCtx.InfoField(), zap.Error(err))
+			c.logger.Warn("failed to update lazy cache", qCtx.InfoField(), zap.Error(err))
 		}
 
-		r := lazyQCtx.R()
+		r := qCtx.R()
 		if r != nil {
-			if err := c.tryStoreMsg(msgKey, r); err != nil {
-				c.L().Error("cache store", qCtx.InfoField(), zap.Error(err))
-			}
+			saveRespToCache(msgKey, r, c.backend, c.args.LazyCacheTTL)
+			c.updatedKey.Add(1)
 		}
-		c.L().Debug("lazy cache updated", lazyQCtx.InfoField())
+		c.logger.Debug("lazy cache updated", qCtx.InfoField())
 		return nil, nil
 	}
 	c.lazyUpdateSF.DoChan(msgKey, lazyUpdateFunc) // DoChan won't block this goroutine
 }
 
-// tryStoreMsg tries to store r to cache. If r should be cached.
-func (c *cachePlugin) tryStoreMsg(key string, r *dns.Msg) error {
-	if r.Rcode != dns.RcodeSuccess || r.Truncated != false {
+func (c *Cache) Close() error {
+	if err := c.dumpCache(); err != nil {
+		c.logger.Error("failed to dump cache", zap.Error(err))
+	}
+	c.closeOnce.Do(func() {
+		close(c.closeNotify)
+	})
+	return c.backend.Close()
+}
+
+func (c *Cache) loadDump() error {
+	if len(c.args.DumpFile) == 0 {
 		return nil
 	}
-
-	v, err := r.Pack()
+	f, err := os.Open(c.args.DumpFile)
 	if err != nil {
-		return fmt.Errorf("failed to pack response msg, %w", err)
+		return err
 	}
-
-	now := time.Now()
-	var expirationTime time.Time
-	if c.args.LazyCacheTTL > 0 {
-		expirationTime = now.Add(time.Duration(c.args.LazyCacheTTL) * time.Second)
-	} else {
-		minTTL := dnsutils.GetMinimalTTL(r)
-		if minTTL == 0 {
-			return nil
-		}
-		expirationTime = now.Add(time.Duration(minTTL) * time.Second)
+	defer f.Close()
+	en, err := c.readDump(f)
+	if err != nil {
+		return err
 	}
-	if c.args.CompressResp {
-		compressBuf := pool.GetBuf(snappy.MaxEncodedLen(len(v)))
-		v = snappy.Encode(compressBuf.Bytes(), v)
-		defer compressBuf.Release()
-	}
-	c.backend.Store(key, v, now, expirationTime)
+	c.logger.Info("cache dump loaded", zap.Int("entries", en))
 	return nil
 }
 
-func (c *cachePlugin) Shutdown() error {
-	return c.backend.Close()
+// startDumpLoop starts a dump loop in another goroutine. It does not block.
+func (c *Cache) startDumpLoop() {
+	if len(c.args.DumpFile) == 0 {
+		return
+	}
+	go func() {
+		ticker := time.NewTicker(time.Duration(c.args.DumpInterval) * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				// Check if we have enough changes to dump.
+				keyUpdated := c.updatedKey.Swap(0)
+				if keyUpdated < minimumChangesToDump { // Nop.
+					c.updatedKey.Add(keyUpdated)
+					continue
+				}
+
+				if err := c.dumpCache(); err != nil {
+					c.logger.Error("dump cache", zap.Error(err))
+				}
+			case <-c.closeNotify:
+				return
+			}
+		}
+	}()
+}
+
+func (c *Cache) dumpCache() error {
+	if len(c.args.DumpFile) == 0 {
+		return nil
+	}
+
+	f, err := os.Create(c.args.DumpFile)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	en, err := c.writeDump(f)
+	if err != nil {
+		return fmt.Errorf("failed to write dump, %w", err)
+	}
+	c.logger.Info("cache dumped", zap.Int("entries", en))
+	return nil
+}
+
+func (c *Cache) Api() *chi.Mux {
+	r := chi.NewRouter()
+	r.Get("/flush", func(w http.ResponseWriter, req *http.Request) {
+		c.backend.Flush()
+	})
+	r.Get("/dump", func(w http.ResponseWriter, req *http.Request) {
+		w.Header().Set("content-type", "application/octet-stream")
+		_, err := c.writeDump(w)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+	})
+	r.Post("/load_dump", func(w http.ResponseWriter, req *http.Request) {
+		if _, err := c.readDump(req.Body); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	})
+	return r
+}
+
+func (c *Cache) writeDump(w io.Writer) (int, error) {
+	en := 0
+
+	gw, _ := gzip.NewWriterLevel(w, gzip.BestSpeed)
+	gw.Name = dumpHeader
+
+	block := new(CacheDumpBlock)
+	writeBlock := func() error {
+		b, err := proto.Marshal(block)
+		if err != nil {
+			return fmt.Errorf("failed to marshal protobuf, %w", err)
+		}
+
+		l := make([]byte, 8)
+		binary.BigEndian.PutUint64(l, uint64(len(b)))
+		_, err = gw.Write(l)
+		if err != nil {
+			return fmt.Errorf("failed to write header, %w", err)
+		}
+		_, err = gw.Write(b)
+		if err != nil {
+			return fmt.Errorf("failed to write data, %w", err)
+		}
+
+		en += len(block.GetEntries())
+		block.Reset()
+		return nil
+	}
+
+	now := time.Now()
+	rangeFunc := func(k key, v *item, cacheExpirationTime time.Time) error {
+		if cacheExpirationTime.Before(now) {
+			return nil
+		}
+		msg, err := v.resp.Pack()
+		if err != nil {
+			return fmt.Errorf("failed to pack msg, %w", err)
+		}
+		e := &CachedEntry{
+			Key:                 string(k),
+			CacheExpirationTime: cacheExpirationTime.Unix(),
+			MsgExpirationTime:   v.expirationTime.Unix(),
+			Msg:                 msg,
+		}
+		block.Entries = append(block.Entries, e)
+
+		// Block is big enough for a write operation.
+		if len(block.Entries) >= dumpBlockSize {
+			return writeBlock()
+		}
+		return nil
+	}
+	if err := c.backend.Range(rangeFunc); err != nil {
+		return en, err
+	}
+
+	if len(block.GetEntries()) > 0 {
+		if err := writeBlock(); err != nil {
+			return en, err
+		}
+	}
+	return en, gw.Close()
+}
+
+// readDump reads dumped data from r. It returns the number of bytes read,
+// number of entries read and any error encountered.
+func (c *Cache) readDump(r io.Reader) (int, error) {
+	en := 0
+	gr, err := gzip.NewReader(r)
+	if err != nil {
+		return en, fmt.Errorf("failed to read gzip header, %w", err)
+	}
+	if gr.Name != dumpHeader {
+		return en, fmt.Errorf("invalid or old cache dump, header is %s, want %s", gr.Name, dumpHeader)
+	}
+
+	var errReadHeaderEOF = errors.New("")
+	readBlock := func() error {
+		h := pool.GetBuf(8)
+		defer pool.ReleaseBuf(h)
+		_, err := io.ReadFull(gr, h)
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				return errReadHeaderEOF
+			}
+			return fmt.Errorf("failed to read block header, %w", err)
+		}
+		u := binary.BigEndian.Uint64(h)
+		if u > dumpMaximumBlockLength {
+			return fmt.Errorf("invalid header, block length is big, %d", u)
+		}
+
+		b := pool.GetBuf(int(u))
+		defer pool.ReleaseBuf(b)
+		_, err = io.ReadFull(gr, b)
+		if err != nil {
+			return fmt.Errorf("failed to read block data, %w", err)
+		}
+
+		block := new(CacheDumpBlock)
+		if err := proto.Unmarshal(b, block); err != nil {
+			return fmt.Errorf("failed to decode block data, %w", err)
+		}
+
+		en += len(block.GetEntries())
+		for _, entry := range block.GetEntries() {
+			cacheExpTime := time.Unix(entry.GetCacheExpirationTime(), 0)
+			msgExpTime := time.Unix(entry.GetMsgExpirationTime(), 0)
+			storedTime := time.Unix(entry.GetMsgStoredTime(), 0)
+			resp := new(dns.Msg)
+			if err := resp.Unpack(entry.GetMsg()); err != nil {
+				return fmt.Errorf("failed to decode dns msg, %w", err)
+			}
+
+			i := &item{
+				resp:           resp,
+				storedTime:     storedTime,
+				expirationTime: msgExpTime,
+			}
+			c.backend.Store(key(entry.GetKey()), i, cacheExpTime)
+		}
+		return nil
+	}
+
+	for {
+		err = readBlock()
+		if err != nil {
+			if err == errReadHeaderEOF {
+				err = nil // This is expected if there is no block to read.
+			}
+			break
+		}
+	}
+
+	if err != nil {
+		return en, err
+	}
+	return en, gr.Close()
 }

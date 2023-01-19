@@ -23,8 +23,8 @@ import (
 	"context"
 	"encoding/base64"
 	"fmt"
-	"github.com/IrineSistiana/mosdns/v4/pkg/pool"
-	"github.com/IrineSistiana/mosdns/v4/pkg/utils"
+	"github.com/IrineSistiana/mosdns/v5/pkg/pool"
+	"github.com/IrineSistiana/mosdns/v5/pkg/utils"
 	"github.com/miekg/dns"
 	"io"
 	"net/http"
@@ -60,7 +60,7 @@ func (u *Upstream) Close() error {
 }
 
 var (
-	bufPool512 = pool.NewBytesBufPool(512)
+	bufPool4k = pool.NewBytesBufPool(4096)
 )
 
 func (u *Upstream) ExchangeContext(ctx context.Context, q *dns.Msg) (*dns.Msg, error) {
@@ -68,7 +68,7 @@ func (u *Upstream) ExchangeContext(ctx context.Context, q *dns.Msg) (*dns.Msg, e
 	if err != nil {
 		return nil, fmt.Errorf("failed to pack query msg, %w", err)
 	}
-	defer buf.Release()
+	defer pool.ReleaseBuf(buf)
 
 	// In order to maximize HTTP cache friendliness, DoH clients using media
 	// formats that include the ID field from the DNS message header, such
@@ -147,8 +147,8 @@ func (u *Upstream) exchange(ctx context.Context, url string) (*dns.Msg, error) {
 		return nil, fmt.Errorf("bad http status codes %d", resp.StatusCode)
 	}
 
-	bb := bufPool512.Get()
-	defer bufPool512.Release(bb)
+	bb := bufPool4k.Get()
+	defer bufPool4k.Release(bb)
 	_, err = bb.ReadFrom(io.LimitReader(resp.Body, dns.MaxMsgSize))
 	if err != nil {
 		return nil, fmt.Errorf("failed to read http body: %w", err)

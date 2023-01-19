@@ -21,9 +21,9 @@ package metrics_collector
 
 import (
 	"context"
-	"github.com/IrineSistiana/mosdns/v4/coremain"
-	"github.com/IrineSistiana/mosdns/v4/pkg/executable_seq"
-	"github.com/IrineSistiana/mosdns/v4/pkg/query_context"
+	"errors"
+	"github.com/IrineSistiana/mosdns/v5/pkg/query_context"
+	"github.com/IrineSistiana/mosdns/v5/plugin/executable/sequence"
 	"github.com/prometheus/client_golang/prometheus"
 	"time"
 )
@@ -31,54 +31,64 @@ import (
 const PluginType = "metrics_collector"
 
 func init() {
-	coremain.RegNewPluginFunc(PluginType, Init, func() interface{} { return new(Args) })
+	sequence.MustRegExecQuickSetup(PluginType, QuickSetup)
 }
 
-type Args struct{}
-
-var _ coremain.ExecutablePlugin = (*Collector)(nil)
+var _ sequence.RecursiveExecutable = (*Collector)(nil)
 
 type Collector struct {
-	*coremain.BP
-
 	queryTotal      prometheus.Counter
 	errTotal        prometheus.Counter
 	thread          prometheus.Gauge
 	responseLatency prometheus.Histogram
 }
 
-func NewCollector(bp *coremain.BP, args *Args) *Collector {
+// NewCollector inits a new Collector with given name to r.
+// name must be unique in the r.
+func NewCollector(r prometheus.Registerer, name string) (*Collector, error) {
+	if len(name) == 0 {
+		return nil, errors.New("collector must has a name")
+	}
+
+	lb := map[string]string{"name": name}
 	var c = &Collector{
-		BP: bp,
 		queryTotal: prometheus.NewCounter(prometheus.CounterOpts{
-			Name: "query_total",
-			Help: "The total number of queries pass through this collector",
+			Name:        "query_total",
+			Help:        "The total number of queries pass through",
+			ConstLabels: lb,
 		}),
 		errTotal: prometheus.NewCounter(prometheus.CounterOpts{
-			Name: "err_total",
-			Help: "The total number of queries failed after this collector",
+			Name:        "err_total",
+			Help:        "The total number of queries failed",
+			ConstLabels: lb,
 		}),
 		thread: prometheus.NewGauge(prometheus.GaugeOpts{
-			Name: "thread",
-			Help: "The number of threads currently through this collector",
+			Name:        "thread",
+			Help:        "The number of threads that are currently being processed",
+			ConstLabels: lb,
 		}),
 		responseLatency: prometheus.NewHistogram(prometheus.HistogramOpts{
-			Name:    "response_latency_millisecond",
-			Help:    "The response latency in millisecond",
-			Buckets: []float64{1, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000},
+			Name:        "response_latency_millisecond",
+			Help:        "The response latency in millisecond",
+			Buckets:     []float64{1, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000},
+			ConstLabels: lb,
 		}),
 	}
-	bp.GetMetricsReg().MustRegister(c.queryTotal, c.errTotal, c.thread, c.responseLatency)
-	return c
+	for _, collector := range [...]prometheus.Collector{c.queryTotal, c.errTotal, c.thread, c.responseLatency} {
+		if err := r.Register(collector); err != nil {
+			return nil, err
+		}
+	}
+	return c, nil
 }
 
-func (c *Collector) Exec(ctx context.Context, qCtx *query_context.Context, next executable_seq.ExecutableChainNode) error {
+func (c *Collector) Exec(ctx context.Context, qCtx *query_context.Context, next sequence.ChainWalker) error {
 	c.thread.Inc()
 	defer c.thread.Dec()
 
 	c.queryTotal.Inc()
 	start := time.Now()
-	err := executable_seq.ExecChainNode(ctx, qCtx, next)
+	err := next.ExecNext(ctx, qCtx)
 	if err != nil {
 		c.errTotal.Inc()
 	}
@@ -88,6 +98,8 @@ func (c *Collector) Exec(ctx context.Context, qCtx *query_context.Context, next 
 	return err
 }
 
-func Init(bp *coremain.BP, args interface{}) (p coremain.Plugin, err error) {
-	return NewCollector(bp, args.(*Args)), nil
+// QuickSetup format: metrics_name
+func QuickSetup(bp sequence.BQ, s string) (any, error) {
+	r := prometheus.WrapRegistererWithPrefix(PluginType+"_", bp.M().GetMetricsReg())
+	return NewCollector(r, s)
 }

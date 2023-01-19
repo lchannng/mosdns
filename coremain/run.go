@@ -21,15 +21,16 @@ package coremain
 
 import (
 	"fmt"
-	"github.com/IrineSistiana/mosdns/v4/mlog"
+	"github.com/IrineSistiana/mosdns/v5/mlog"
 	"github.com/kardianos/service"
 	"github.com/mitchellh/mapstructure"
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
 	"go.uber.org/zap"
 	"os"
+	"os/signal"
 	"runtime"
-	"strings"
+	"syscall"
 )
 
 type serverFlags struct {
@@ -56,7 +57,20 @@ func init() {
 				}
 				return svc.Run()
 			}
-			return StartServer(sf)
+
+			m, err := NewServer(sf)
+			if err != nil {
+				return err
+			}
+
+			go func() {
+				c := make(chan os.Signal, 1)
+				signal.Notify(c, syscall.SIGINT, syscall.SIGTERM)
+				sig := <-c
+				m.logger.Warn("signal received", zap.Stringer("signal", sig))
+				m.sc.SendCloseSignal(nil)
+			}()
+			return m.GetSafeClose().WaitClosed()
 		},
 		DisableFlagsInUseLine: true,
 		SilenceUsage:          true,
@@ -67,7 +81,7 @@ func init() {
 	fs.StringVarP(&sf.dir, "dir", "d", "", "working dir")
 	fs.IntVar(&sf.cpu, "cpu", 0, "set runtime.GOMAXPROCS")
 	fs.BoolVar(&sf.asService, "as-service", false, "start as a service")
-	fs.MarkHidden("as-service")
+	_ = fs.MarkHidden("as-service")
 
 	serviceCmd := &cobra.Command{
 		Use:   "service",
@@ -93,7 +107,7 @@ func Run() error {
 	return rootCmd.Execute()
 }
 
-func StartServer(sf *serverFlags) error {
+func NewServer(sf *serverFlags) (*Mosdns, error) {
 	if sf.cpu > 0 {
 		runtime.GOMAXPROCS(sf.cpu)
 	}
@@ -101,24 +115,18 @@ func StartServer(sf *serverFlags) error {
 	if len(sf.dir) > 0 {
 		err := os.Chdir(sf.dir)
 		if err != nil {
-			return fmt.Errorf("failed to change the current working directory, %w", err)
+			return nil, fmt.Errorf("failed to change the current working directory, %w", err)
 		}
 		mlog.L().Info("working directory changed", zap.String("path", sf.dir))
 	}
 
 	cfg, fileUsed, err := loadConfig(sf.c)
 	if err != nil {
-		return fmt.Errorf("fail to load config, %w", err)
+		return nil, fmt.Errorf("fail to load config, %w", err)
 	}
+	mlog.L().Info("main config loaded", zap.String("file", fileUsed))
 
-	if err := mergeInclude(cfg, 0, []string{fileUsed}); err != nil {
-		return fmt.Errorf("failed to load sub config file, %w", err)
-	}
-
-	if err := RunMosdns(cfg); err != nil {
-		return fmt.Errorf("mosdns exited, %w", err)
-	}
-	return nil
+	return NewMosdns(cfg)
 }
 
 // loadConfig load a config from a file. If filePath is empty, it will
@@ -148,33 +156,4 @@ func loadConfig(filePath string) (*Config, string, error) {
 		return nil, "", fmt.Errorf("failed to unmarshal config: %w", err)
 	}
 	return cfg, v.ConfigFileUsed(), nil
-}
-
-func mergeInclude(cfg *Config, depth int, paths []string) error {
-	depth++
-	if depth > 8 {
-		return fmt.Errorf("maximun include depth reached, include path is %s", strings.Join(paths, " -> "))
-	}
-
-	includedCfg := new(Config)
-	for _, subCfgFile := range cfg.Include {
-		subPaths := append(paths, subCfgFile)
-		mlog.L().Info("reading sub config", zap.String("file", subCfgFile))
-		subCfg, _, err := loadConfig(subCfgFile)
-		if err != nil {
-			return fmt.Errorf("failed to load sub config, %w", err)
-		}
-		if err := mergeInclude(subCfg, depth, subPaths); err != nil {
-			return err
-		}
-
-		includedCfg.DataProviders = append(includedCfg.DataProviders, subCfg.DataProviders...)
-		includedCfg.Plugins = append(includedCfg.Plugins, subCfg.Plugins...)
-		includedCfg.Servers = append(includedCfg.Servers, subCfg.Servers...)
-	}
-
-	cfg.DataProviders = append(includedCfg.DataProviders, cfg.DataProviders...)
-	cfg.Plugins = append(includedCfg.Plugins, cfg.Plugins...)
-	cfg.Servers = append(includedCfg.Servers, cfg.Servers...)
-	return nil
 }

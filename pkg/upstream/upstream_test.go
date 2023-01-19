@@ -24,7 +24,7 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
-	"github.com/IrineSistiana/mosdns/v4/pkg/utils"
+	"github.com/IrineSistiana/mosdns/v5/pkg/utils"
 	"github.com/miekg/dns"
 	"net"
 	"sync"
@@ -125,7 +125,7 @@ func Test_fastUpstream(t *testing.T) {
 						defer shutdownServer()
 						u, err := NewUpstream(
 							scheme+"://"+addr,
-							&Opt{
+							Opt{
 								IdleTimeout: time.Second,
 								MaxConns:    5,
 								TLSConfig:   &tls.Config{InsecureSkipVerify: true},
