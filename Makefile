@@ -117,3 +117,6 @@ lint:
 
 clean:
 	rm $(BINDIR)/*
+
+ho-deploy:
+	scp -O ./bin/mosdns-linux-amd64 ho:/opt/mosdns/
