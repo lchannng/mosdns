@@ -24,6 +24,9 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
+	"strings"
+	"time"
+
 	"github.com/IrineSistiana/mosdns/v5/coremain"
 	"github.com/IrineSistiana/mosdns/v5/pkg/query_context"
 	"github.com/IrineSistiana/mosdns/v5/pkg/upstream"
@@ -32,8 +35,6 @@ import (
 	"github.com/miekg/dns"
 	"github.com/prometheus/client_golang/prometheus"
 	"go.uber.org/zap"
-	"strings"
-	"time"
 )
 
 const PluginType = "forward"
@@ -57,6 +58,7 @@ type Args struct {
 	SoMark       int    `yaml:"so_mark"`
 	BindToDevice string `yaml:"bind_to_device"`
 	Bootstrap    string `yaml:"bootstrap"`
+	BootstrapVer int    `yaml:"bootstrap_version"`
 }
 
 type UpstreamConfig struct {
@@ -73,6 +75,7 @@ type UpstreamConfig struct {
 	SoMark       int    `yaml:"so_mark"`
 	BindToDevice string `yaml:"bind_to_device"`
 	Bootstrap    string `yaml:"bootstrap"`
+	BootstrapVer int    `yaml:"bootstrap_version"`
 }
 
 func Init(bp *coremain.BP, args any) (any, error) {
@@ -94,7 +97,7 @@ type Forward struct {
 	args *Args
 
 	logger       *zap.Logger
-	us           map[*upstreamWrapper]struct{}
+	us           []*upstreamWrapper
 	tag2Upstream map[string]*upstreamWrapper // for fast tag lookup only.
 }
 
@@ -116,7 +119,6 @@ func NewForward(args *Args, opt Opts) (*Forward, error) {
 	f := &Forward{
 		args:         args,
 		logger:       opt.Logger,
-		us:           make(map[*upstreamWrapper]struct{}),
 		tag2Upstream: make(map[string]*upstreamWrapper),
 	}
 
@@ -125,6 +127,7 @@ func NewForward(args *Args, opt Opts) (*Forward, error) {
 		utils.SetDefaultUnsignNum(&c.SoMark, args.SoMark)
 		utils.SetDefaultString(&c.BindToDevice, args.BindToDevice)
 		utils.SetDefaultString(&c.Bootstrap, args.Bootstrap)
+		utils.SetDefaultUnsignNum(&c.BootstrapVer, args.BootstrapVer)
 	}
 
 	for i, c := range args.Upstreams {
@@ -133,7 +136,7 @@ func NewForward(args *Args, opt Opts) (*Forward, error) {
 		}
 		applyGlobal(&c)
 
-		uw := newWrapper(c, opt.MetricsTag)
+		uw := newWrapper(i, c, opt.MetricsTag)
 		uOpt := upstream.Opt{
 			DialAddr:       c.DialAddr,
 			Socks5:         c.Socks5,
@@ -144,6 +147,7 @@ func NewForward(args *Args, opt Opts) (*Forward, error) {
 			EnablePipeline: c.EnablePipeline,
 			EnableHTTP3:    c.EnableHTTP3,
 			Bootstrap:      c.Bootstrap,
+			BootstrapVer:   c.BootstrapVer,
 			TLSConfig: &tls.Config{
 				InsecureSkipVerify: c.InsecureSkipVerify,
 				ClientSessionCache: tls.NewLRUClientSessionCache(4),
@@ -158,7 +162,7 @@ func NewForward(args *Args, opt Opts) (*Forward, error) {
 			return nil, fmt.Errorf("failed to init upstream #%d: %w", i, err)
 		}
 		uw.u = u
-		f.us[uw] = struct{}{}
+		f.us = append(f.us, uw)
 
 		if len(c.Tag) > 0 {
 			if _, dup := f.tag2Upstream[c.Tag]; dup {
@@ -173,7 +177,7 @@ func NewForward(args *Args, opt Opts) (*Forward, error) {
 }
 
 func (f *Forward) RegisterMetricsTo(r prometheus.Registerer) error {
-	for wu := range f.us {
+	for _, wu := range f.us {
 		// Only register metrics for upstream that has a tag.
 		if len(wu.cfg.Tag) == 0 {
 			continue
@@ -196,17 +200,16 @@ func (f *Forward) Exec(ctx context.Context, qCtx *query_context.Context) (err er
 
 // QuickConfigureExec format: [upstream_tag]...
 func (f *Forward) QuickConfigureExec(args string) (any, error) {
-	var us map[*upstreamWrapper]struct{}
+	var us []*upstreamWrapper
 	if len(args) == 0 { // No args, use all upstreams.
 		us = f.us
 	} else { // Pick up upstreams by tags.
-		us = make(map[*upstreamWrapper]struct{})
 		for _, tag := range strings.Fields(args) {
 			u := f.tag2Upstream[tag]
 			if u == nil {
 				return nil, fmt.Errorf("cannot find upstream by tag %s", tag)
 			}
-			us[u] = struct{}{}
+			us = append(us, u)
 		}
 	}
 	var execFunc sequence.ExecutableFunc = func(ctx context.Context, qCtx *query_context.Context) error {
@@ -221,13 +224,13 @@ func (f *Forward) QuickConfigureExec(args string) (any, error) {
 }
 
 func (f *Forward) Close() error {
-	for u := range f.us {
-		_ = (*u).Close()
+	for _, u := range f.us {
+		_ = u.Close()
 	}
 	return nil
 }
 
-func (f *Forward) exchange(ctx context.Context, qCtx *query_context.Context, us map[*upstreamWrapper]struct{}) (*dns.Msg, error) {
+func (f *Forward) exchange(ctx context.Context, qCtx *query_context.Context, us []*upstreamWrapper) (*dns.Msg, error) {
 	if len(us) == 0 {
 		return nil, errors.New("no upstream to exchange")
 	}
@@ -235,6 +238,9 @@ func (f *Forward) exchange(ctx context.Context, qCtx *query_context.Context, us 
 	mcq := f.args.Concurrent
 	if mcq <= 0 {
 		mcq = 1
+	}
+	if mcq > len(us) {
+		mcq = len(us)
 	}
 	if mcq > maxConcurrentQueries {
 		mcq = maxConcurrentQueries
@@ -252,16 +258,10 @@ func (f *Forward) exchange(ctx context.Context, qCtx *query_context.Context, us 
 
 	qc := qCtx.Q().Copy()
 	uqid := qCtx.Id()
-	sent := 0
-	for u := range us {
-		if sent > mcq {
-			break
-		}
-		sent++
-
-		u := u
+	for i := 0; i < mcq; i++ {
+		u := randPick(us)
 		go func() {
-			// Give each upstream a fixed timeout to finsh the query.
+			// Give each upstream a fixed timeout to finish the query.
 			upstreamCtx, cancel := context.WithTimeout(context.Background(), queryTimeout)
 			defer cancel()
 			r, err := u.ExchangeContext(upstreamCtx, qc)
@@ -281,25 +281,24 @@ func (f *Forward) exchange(ctx context.Context, qCtx *query_context.Context, us 
 		}()
 	}
 
-	es := new(utils.Errors)
-	for i := 0; i < sent; i++ {
+	for i := 0; i < mcq; i++ {
 		select {
 		case res := <-resChan:
-			r, u, err := res.r, res.u, res.err
+			r, err := res.r, res.err
 			if err != nil {
-				es.Append(&upstreamErr{
-					upstreamName: u.name(),
-					err:          err,
-				})
+				continue
+			}
+
+			// Retry until the last
+			if i < mcq-1 && r.Rcode != dns.RcodeSuccess && r.Rcode != dns.RcodeNameError {
 				continue
 			}
 			return r, nil
 		case <-ctx.Done():
-			es.Append(fmt.Errorf("exchange: %w", ctx.Err()))
-			return nil, es
+			return nil, ctx.Err()
 		}
 	}
-	return nil, es
+	return nil, errors.New("all upstream servers failed")
 }
 
 func quickSetup(bq sequence.BQ, s string) (any, error) {

@@ -21,14 +21,15 @@ package dual_selector
 
 import (
 	"context"
+	"net"
+	"testing"
+	"time"
+
 	"github.com/IrineSistiana/mosdns/v5/coremain"
 	"github.com/IrineSistiana/mosdns/v5/pkg/query_context"
 	"github.com/IrineSistiana/mosdns/v5/plugin/executable/sequence"
 	"github.com/miekg/dns"
 	"go.uber.org/zap"
-	"net"
-	"testing"
-	"time"
 )
 
 type dummyNext struct {

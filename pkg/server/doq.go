@@ -21,7 +21,6 @@ package server
 
 import (
 	"context"
-	"crypto/tls"
 	"fmt"
 	"net"
 	"net/netip"
@@ -29,89 +28,91 @@ import (
 
 	"github.com/IrineSistiana/mosdns/v5/pkg/dnsutils"
 	"github.com/IrineSistiana/mosdns/v5/pkg/pool"
+	"github.com/quic-go/quic-go"
 	"go.uber.org/zap"
 )
 
 const (
-	defaultTCPIdleTimeout = time.Second * 10
-	tcpFirstReadTimeout   = time.Millisecond * 500
+	defaultQuicIdleTimeout = time.Second * 30
+	streamReadTimeout      = time.Second * 1
+	quicFirstReadTimeout   = time.Millisecond * 500
 )
 
-type TCPServerOpts struct {
-	// Nil logger == nop
-	Logger *zap.Logger
-
-	// Default is defaultTCPIdleTimeout.
+type DoQServerOpts struct {
+	Logger      *zap.Logger
 	IdleTimeout time.Duration
 }
 
-// ServeTCP starts a server at l. It returns if l had an Accept() error.
+// ServeDoQ starts a server at l. It returns if l had an Accept() error.
 // It always returns a non-nil error.
-func ServeTCP(l net.Listener, h Handler, opts TCPServerOpts) error {
+func ServeDoQ(l *quic.Listener, h Handler, opts DoQServerOpts) error {
 	logger := opts.Logger
 	if logger == nil {
 		logger = nopLogger
 	}
 	idleTimeout := opts.IdleTimeout
 	if idleTimeout <= 0 {
-		idleTimeout = defaultTCPIdleTimeout
-	}
-	firstReadTimeout := tcpFirstReadTimeout
-	if idleTimeout < firstReadTimeout {
-		firstReadTimeout = idleTimeout
+		idleTimeout = defaultQuicIdleTimeout
 	}
 
 	listenerCtx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	for {
-		c, err := l.Accept()
+		c, err := l.Accept(listenerCtx)
 		if err != nil {
 			return fmt.Errorf("unexpected listener err: %w", err)
 		}
 
 		// handle connection
-		tcpConnCtx, cancelConn := context.WithCancel(listenerCtx)
+		connCtx, cancelConn := context.WithCancel(listenerCtx)
 		go func() {
-			defer c.Close()
+			defer c.CloseWithError(0, "")
 			defer cancelConn()
 
 			var clientAddr netip.Addr
-			ta, ok := c.RemoteAddr().(*net.TCPAddr)
+			ta, ok := c.RemoteAddr().(*net.UDPAddr)
 			if ok {
 				clientAddr = ta.AddrPort().Addr()
 			}
 
 			firstRead := true
 			for {
+				var streamAcceptTimeout time.Duration
 				if firstRead {
 					firstRead = false
-					c.SetReadDeadline(time.Now().Add(firstReadTimeout))
+					streamAcceptTimeout = quicFirstReadTimeout
 				} else {
-					c.SetReadDeadline(time.Now().Add(idleTimeout))
+					streamAcceptTimeout = idleTimeout
 				}
-				req, _, err := dnsutils.ReadMsgFromTCP(c)
+				streamAcceptCtx, cancelStreamAccept := context.WithTimeout(connCtx, streamAcceptTimeout)
+				stream, err := c.AcceptStream(streamAcceptCtx)
+				cancelStreamAccept()
 				if err != nil {
-					return // read err, close the connection
+					return
 				}
 
-				// Try to get server name from tls conn.
-				var serverName string
-				if tlsConn, ok := c.(*tls.Conn); ok {
-					serverName = tlsConn.ConnectionState().ServerName
-				}
-
-				// handle query
+				// Handle stream.
+				// For doq, one stream, one query.
 				go func() {
-					r := h.Handle(tcpConnCtx, req, QueryMeta{ClientAddr: clientAddr, ServerName: serverName}, pool.PackTCPBuffer)
-					if r == nil {
-						c.Close() // abort the connection
+					defer stream.Close()
+
+					// Avoid fragmentation attack.
+					stream.SetReadDeadline(time.Now().Add(streamReadTimeout))
+					req, _, err := dnsutils.ReadMsgFromTCP(stream)
+					if err != nil {
 						return
 					}
-					defer pool.ReleaseBuf(r)
+					queryMeta := QueryMeta{
+						ClientAddr: clientAddr,
+						ServerName: c.ConnectionState().TLS.ServerName,
+					}
 
-					if _, err := c.Write(*r); err != nil {
-						logger.Warn("failed to write response", zap.Stringer("client", c.RemoteAddr()), zap.Error(err))
+					resp := h.Handle(connCtx, req, queryMeta, pool.PackTCPBuffer)
+					if resp == nil {
 						return
+					}
+					if _, err := stream.Write(*resp); err != nil {
+						logger.Warn("failed to write response", zap.Stringer("client", c.RemoteAddr()), zap.Error(err))
 					}
 				}()
 			}

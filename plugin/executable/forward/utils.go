@@ -21,15 +21,17 @@ package fastforward
 
 import (
 	"context"
-	"fmt"
+	"math/rand"
+	"time"
+
 	"github.com/IrineSistiana/mosdns/v5/pkg/upstream"
 	"github.com/miekg/dns"
 	"github.com/prometheus/client_golang/prometheus"
 	"go.uber.org/zap/zapcore"
-	"time"
 )
 
 type upstreamWrapper struct {
+	idx             int
 	u               upstream.Upstream
 	cfg             UpstreamConfig
 	queryTotal      prometheus.Counter
@@ -52,7 +54,7 @@ func (uw *upstreamWrapper) OnEvent(typ upstream.Event) {
 
 // newWrapper inits all metrics.
 // Note: upstreamWrapper.u still needs to be set.
-func newWrapper(cfg UpstreamConfig, pluginTag string) *upstreamWrapper {
+func newWrapper(idx int, cfg UpstreamConfig, pluginTag string) *upstreamWrapper {
 	lb := map[string]string{"upstream": cfg.Tag, "tag": pluginTag}
 	return &upstreamWrapper{
 		cfg: cfg,
@@ -150,15 +152,6 @@ func (q *queryInfo) MarshalLogObject(encoder zapcore.ObjectEncoder) error {
 	return nil
 }
 
-type upstreamErr struct {
-	upstreamName string
-	err          error
-}
-
-func (u *upstreamErr) Unwrap() error {
-	return u.err
-}
-
-func (u *upstreamErr) Error() string {
-	return fmt.Sprintf("upstream %s: %s", u.upstreamName, u.err)
+func randPick[T any](s []T) T {
+	return s[rand.Intn(len(s))]
 }

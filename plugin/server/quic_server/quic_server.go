@@ -17,10 +17,11 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-package tcp_server
+package quic_server
 
 import (
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"net"
 	"time"
@@ -29,9 +30,11 @@ import (
 	"github.com/IrineSistiana/mosdns/v5/pkg/server"
 	"github.com/IrineSistiana/mosdns/v5/pkg/utils"
 	"github.com/IrineSistiana/mosdns/v5/plugin/server/server_utils"
+	"github.com/quic-go/quic-go"
+	"go.uber.org/zap"
 )
 
-const PluginType = "tcp_server"
+const PluginType = "quic_server"
 
 func init() {
 	coremain.RegNewPluginFunc(PluginType, Init, func() any { return new(Args) })
@@ -46,17 +49,16 @@ type Args struct {
 }
 
 func (a *Args) init() {
-	utils.SetDefaultString(&a.Listen, "127.0.0.1:53")
-	utils.SetDefaultNum(&a.IdleTimeout, 10)
+	utils.SetDefaultNum(&a.IdleTimeout, 30)
 }
 
-type TcpServer struct {
+type QuicServer struct {
 	args *Args
 
-	l net.Listener
+	l *quic.Listener
 }
 
-func (s *TcpServer) Close() error {
+func (s *QuicServer) Close() error {
 	return s.l.Close()
 }
 
@@ -64,37 +66,63 @@ func Init(bp *coremain.BP, args any) (any, error) {
 	return StartServer(bp, args.(*Args))
 }
 
-func StartServer(bp *coremain.BP, args *Args) (*TcpServer, error) {
+func StartServer(bp *coremain.BP, args *Args) (*QuicServer, error) {
+	logger := bp.L()
+
 	dh, err := server_utils.NewHandler(bp, args.Entry)
 	if err != nil {
 		return nil, fmt.Errorf("failed to init dns handler, %w", err)
 	}
 
 	// Init tls
-	var tc *tls.Config
-	if len(args.Key)+len(args.Cert) > 0 {
-		tc = new(tls.Config)
-		if err := server.LoadCert(tc, args.Cert, args.Key); err != nil {
-			return nil, fmt.Errorf("failed to read tls cert, %w", err)
-		}
+	if len(args.Key) == 0 || len(args.Cert) == 0 {
+		return nil, errors.New("quic server requires a tls certificate")
 	}
+	tlsConfig := new(tls.Config)
+	if err := server.LoadCert(tlsConfig, args.Cert, args.Key); err != nil {
+		return nil, fmt.Errorf("failed to read tls cert, %w", err)
+	}
+	tlsConfig.NextProtos = []string{"doq"}
 
-	l, err := net.Listen("tcp", args.Listen)
+	uc, err := net.ListenPacket("udp", args.Listen)
 	if err != nil {
 		return nil, fmt.Errorf("failed to listen socket, %w", err)
 	}
-	if tc != nil {
-		l = tls.NewListener(l, tc)
+
+	idleTimeout := time.Duration(args.IdleTimeout) * time.Second
+
+	quicConfig := &quic.Config{
+		MaxIdleTimeout:                 idleTimeout,
+		InitialStreamReceiveWindow:     4 * 1024,
+		MaxStreamReceiveWindow:         4 * 1024,
+		InitialConnectionReceiveWindow: 8 * 1024,
+		MaxConnectionReceiveWindow:     16 * 1024,
+		Allow0RTT:                      false,
+	}
+
+	srk, _, err := utils.InitQUICSrkFromIfaceMac()
+	if err != nil {
+		logger.Warn("failed to init quic stateless reset key, it will be disabled", zap.Error(err))
+	}
+	qt := &quic.Transport{
+		Conn:              uc,
+		StatelessResetKey: (*quic.StatelessResetKey)(srk),
+	}
+
+	quicListener, err := qt.Listen(tlsConfig, quicConfig)
+	if err != nil {
+		qt.Close()
+		return nil, fmt.Errorf("failed to listen quic, %w", err)
 	}
 
 	go func() {
-		defer l.Close()
-		serverOpts := server.TCPServerOpts{Logger: bp.L(), IdleTimeout: time.Duration(args.IdleTimeout) * time.Second}
-		err := server.ServeTCP(l, dh, serverOpts)
+		defer quicListener.Close()
+		serverOpts := server.DoQServerOpts{Logger: bp.L(), IdleTimeout: idleTimeout}
+		err := server.ServeDoQ(quicListener, dh, serverOpts)
 		bp.M().GetSafeClose().SendCloseSignal(err)
 	}()
-	return &TcpServer{
+	return &QuicServer{
 		args: args,
-		l:    l,
+		l:    quicListener,
 	}, nil
 }
