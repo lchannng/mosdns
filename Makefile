@@ -119,4 +119,5 @@ clean:
 	rm $(BINDIR)/*
 
 ho-deploy:
-	scp -O ./bin/mosdns-linux-amd64 ho:/opt/mosdns/
+	rsync -vzP ./bin/mosdns-linux-amd64 ho:/opt/mosdns/mosdns
+	ssh ho -t '/etc/init.d/mosdns restart'
