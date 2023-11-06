@@ -34,7 +34,7 @@ import (
 
 const (
 	defaultTCPIdleTimeout = time.Second * 10
-	tcpFirstReadTimeout   = time.Millisecond * 500
+	tcpFirstReadTimeout   = time.Second * 2
 )
 
 type TCPServerOpts struct {
@@ -61,8 +61,8 @@ func ServeTCP(l net.Listener, h Handler, opts TCPServerOpts) error {
 		firstReadTimeout = idleTimeout
 	}
 
-	listenerCtx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	listenerCtx, cancel := context.WithCancelCause(context.Background())
+	defer cancel(errListenerCtxCanceled)
 	for {
 		c, err := l.Accept()
 		if err != nil {
@@ -70,16 +70,10 @@ func ServeTCP(l net.Listener, h Handler, opts TCPServerOpts) error {
 		}
 
 		// handle connection
-		tcpConnCtx, cancelConn := context.WithCancel(listenerCtx)
+		tcpConnCtx, cancelConn := context.WithCancelCause(listenerCtx)
 		go func() {
 			defer c.Close()
-			defer cancelConn()
-
-			var clientAddr netip.Addr
-			ta, ok := c.RemoteAddr().(*net.TCPAddr)
-			if ok {
-				clientAddr = ta.AddrPort().Addr()
-			}
+			defer cancelConn(errConnectionCtxCanceled)
 
 			firstRead := true
 			for {
@@ -102,6 +96,11 @@ func ServeTCP(l net.Listener, h Handler, opts TCPServerOpts) error {
 
 				// handle query
 				go func() {
+					var clientAddr netip.Addr
+					ta, ok := c.RemoteAddr().(*net.TCPAddr)
+					if ok {
+						clientAddr = ta.AddrPort().Addr()
+					}
 					r := h.Handle(tcpConnCtx, req, QueryMeta{ClientAddr: clientAddr, ServerName: serverName}, pool.PackTCPBuffer)
 					if r == nil {
 						c.Close() // abort the connection

@@ -20,6 +20,7 @@
 package udp_server
 
 import (
+	"context"
 	"fmt"
 	"net"
 
@@ -27,6 +28,7 @@ import (
 	"github.com/IrineSistiana/mosdns/v5/pkg/server"
 	"github.com/IrineSistiana/mosdns/v5/pkg/utils"
 	"github.com/IrineSistiana/mosdns/v5/plugin/server/server_utils"
+	"go.uber.org/zap"
 )
 
 const PluginType = "udp_server"
@@ -64,10 +66,17 @@ func StartServer(bp *coremain.BP, args *Args) (*UdpServer, error) {
 		return nil, fmt.Errorf("failed to init dns handler, %w", err)
 	}
 
-	c, err := net.ListenPacket("udp", args.Listen)
+	socketOpt := server_utils.ListenerSocketOpts{
+		SO_REUSEPORT: true,
+		SO_RCVBUF:    64 * 1024,
+	}
+	lc := net.ListenConfig{Control: server_utils.ListenerControl(socketOpt)}
+	c, err := lc.ListenPacket(context.Background(), "udp", args.Listen)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create socket, %w", err)
 	}
+	bp.L().Info("udp server started", zap.Stringer("addr", c.LocalAddr()))
+
 	go func() {
 		defer c.Close()
 		err := server.ServeUDP(c.(*net.UDPConn), dh, server.UDPServerOpts{Logger: bp.L()})

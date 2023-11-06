@@ -98,6 +98,9 @@ func StartServer(bp *coremain.BP, args *Args) (*QuicServer, error) {
 		InitialConnectionReceiveWindow: 8 * 1024,
 		MaxConnectionReceiveWindow:     16 * 1024,
 		Allow0RTT:                      false,
+
+		// UniStream is not allowed.
+		MaxIncomingUniStreams: -1,
 	}
 
 	srk, _, err := utils.InitQUICSrkFromIfaceMac()
@@ -114,6 +117,7 @@ func StartServer(bp *coremain.BP, args *Args) (*QuicServer, error) {
 		qt.Close()
 		return nil, fmt.Errorf("failed to listen quic, %w", err)
 	}
+	bp.L().Info("quic server started", zap.Stringer("addr", quicListener.Addr()))
 
 	go func() {
 		defer quicListener.Close()

@@ -20,14 +20,18 @@
 package tcp_server
 
 import (
+	"context"
 	"fmt"
+	"net"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/IrineSistiana/mosdns/v5/coremain"
 	"github.com/IrineSistiana/mosdns/v5/pkg/server"
 	"github.com/IrineSistiana/mosdns/v5/pkg/utils"
 	"github.com/IrineSistiana/mosdns/v5/plugin/server/server_utils"
+	"go.uber.org/zap"
 	"golang.org/x/net/http2"
 )
 
@@ -82,8 +86,23 @@ func StartServer(bp *coremain.BP, args *Args) (*HttpServer, error) {
 		mux.Handle(entry.Path, hh)
 	}
 
+	socketOpt := server_utils.ListenerSocketOpts{
+		SO_REUSEPORT: true,
+		SO_RCVBUF:    64 * 1024,
+	}
+	lc := net.ListenConfig{Control: server_utils.ListenerControl(socketOpt)}
+
+	listenerNetwork := "tcp"
+	if strings.HasPrefix(args.Listen, "@") {
+		listenerNetwork = "unix"
+	}
+	l, err := lc.Listen(context.Background(), listenerNetwork, args.Listen)
+	if err != nil {
+		return nil, fmt.Errorf("failed to listen socket, %w", err)
+	}
+	bp.L().Info("http server started", zap.Stringer("addr", l.Addr()))
+
 	hs := &http.Server{
-		Addr:           args.Listen,
 		Handler:        mux,
 		ReadTimeout:    time.Second,
 		IdleTimeout:    time.Duration(args.IdleTimeout) * time.Second,
@@ -101,9 +120,9 @@ func StartServer(bp *coremain.BP, args *Args) (*HttpServer, error) {
 	go func() {
 		var err error
 		if len(args.Key)+len(args.Cert) > 0 {
-			err = hs.ListenAndServeTLS(args.Cert, args.Key)
+			err = hs.ServeTLS(l, args.Cert, args.Key)
 		} else {
-			err = hs.ListenAndServe()
+			err = hs.Serve(l)
 		}
 		bp.M().GetSafeClose().SendCloseSignal(err)
 	}()

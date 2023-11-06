@@ -90,7 +90,7 @@ func (sp *Bootstrap) GetAddrPortStr(ctx context.Context) (string, error) {
 
 	select {
 	case <-ctx.Done():
-		return "", ctx.Err()
+		return "", context.Cause(ctx)
 	case <-sp.readyNotify:
 	}
 
@@ -110,15 +110,17 @@ func (sp *Bootstrap) tryUpdate() {
 				start := time.Now()
 				addr, ttl, err := sp.updateAddr(ctx)
 				if err != nil {
-					sp.logger.Warn("failed to update bootstrap addr", zap.String("fqdn", sp.fqdn), zap.Error(err))
+					sp.logger.Check(zap.WarnLevel, "failed to update bootstrap addr").Write(
+						zap.String("fqdn", sp.fqdn),
+						zap.Error(err),
+					)
 					sp.nextUpdate = time.Now().Add(retryInterval)
 				} else {
 					updateInterval := time.Second * time.Duration(ttl)
 					if updateInterval < minimumUpdateInterval {
 						updateInterval = minimumUpdateInterval
 					}
-					sp.logger.Info(
-						"bootstrap addr updated",
+					sp.logger.Check(zap.DebugLevel, "bootstrap addr updated").Write(
 						zap.String("fqdn", sp.fqdn),
 						zap.Stringer("addr", addr),
 						zap.Duration("ttl", updateInterval),
@@ -200,7 +202,7 @@ func (sp *Bootstrap) resolve(ctx context.Context, qt uint16) (netip.Addr, uint32
 
 	select {
 	case <-ctx.Done():
-		return netip.Addr{}, 0, ctx.Err()
+		return netip.Addr{}, 0, context.Cause(ctx)
 	case err := <-writeErrC:
 		return netip.Addr{}, 0, fmt.Errorf("failed to write query, %w", err)
 	case r := <-readResC:
